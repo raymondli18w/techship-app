@@ -3,5 +3,7 @@ services:
     name: techship-dash2
     env: python
     pythonVersion: "3.12.5"
-    buildCommand: python -m pip install --upgrade pip wheel setuptools && pip install -r requirements.txt
+    buildCommand: |
+      python -m pip install --upgrade pip wheel setuptools
+      pip install -r requirements.txt
     startCommand: streamlit run techship_dash2.py --server.port $PORT --server.address 0.0.0.0
