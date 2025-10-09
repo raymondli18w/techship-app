@@ -14,6 +14,11 @@ from collections import defaultdict
 from sqlite_lookup import get_address_by_prefix
 
 # =========================
+# MUST be the first Streamlit command
+# =========================
+st.set_page_config(page_title="TechSHIP Bulk Shipper", page_icon="📦", layout="wide")
+
+# =========================
 # TechSHIP API Configuration
 # =========================
 API_URL = "https://18wheels.techship.ca/api/v3/shipments/create?duplicateHandling=2"
@@ -472,7 +477,6 @@ def add_selectable_css():
 # =========================
 def main():
     add_selectable_css()
-    st.set_page_config(page_title="TechSHIP Bulk Shipper", page_icon="📦", layout="wide")
     st.title("📦 TechSHIP Bulk Shipment Processor")
     st.markdown("### Compare pricing across box sizes and weights")
 
