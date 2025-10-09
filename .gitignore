@@ -1,0 +1,15 @@
+# Ignore system and temp files
+*.log
+*.blf
+*.TMContainer*
+ntuser.dat*
+AppData/
+Documents/
+Downloads/
+Music/
+Videos/
+Saved Games/
+Favorites/
+Contacts/
+Links/
+OneDrive*/

@@ -1,0 +1,8 @@
+services:
+  - type: web
+    name: techship-app
+    env: python
+    plan: free
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run techship_dash2.py --server.port $PORT
