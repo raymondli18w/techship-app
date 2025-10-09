@@ -1,8 +1,15 @@
+# render.yaml
 services:
   - type: web
     name: techship-app
     env: python
     plan: free
+    region: oregon
     branch: main
     buildCommand: pip install -r requirements.txt
     startCommand: streamlit run techship_dash2.py --server.port $PORT
+    envVars:
+      - key: API_KEY
+        fromSecret: API_KEY
+      - key: API_SECRET
+        fromSecret: API_SECRET

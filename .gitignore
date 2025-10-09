@@ -1,4 +1,5 @@
-# Ignore system and temp files
+# Ignore database and temp files
+*.db
 *.log
 *.blf
 *.TMContainer*
