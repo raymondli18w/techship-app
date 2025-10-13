@@ -108,7 +108,10 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
         'po_number': 'order_id',
         'carrier': 'carrier',
         'carreir': 'carrier',  # Fix common typo
-        'carrier_code': 'carrier'
+        'carrier_code': 'carrier',
+        'length': 'length',
+        'width': 'width',
+        'height': 'height'
     }
     df.columns = [column_mapping.get(col, col) for col in df.columns]
 
@@ -118,9 +121,12 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
         st.error(f"❌ Missing required columns: {missing_columns}")
         return None
 
+    # Check for lwh columns OR manual dimensions
     lwh_columns = [col for col in df.columns if col.startswith('lwh')]
-    if not lwh_columns:
-        st.error("❌ No 'lwh', 'lwh2', 'lwh3', etc. columns found. At least one is required.")
+    has_manual_dims = all(col in df.columns for col in ['length', 'width', 'height'])
+
+    if not lwh_columns and not has_manual_dims:
+        st.error("❌ Either provide 'lwh', 'lwh2', ... columns OR 'length', 'width', 'height' columns.")
         return None
 
     # Detect weight columns
@@ -257,12 +263,38 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
             "Email": email
         }
 
-        # Get valid lwh values
-        lwh_values = {}
-        for lwh_col in lwh_columns:
-            val = safe_float(lwh_col)
-            if val is not None and val > 0:
-                lwh_values[lwh_col] = val
+        # Handle dimensions: either lwh# OR manual length/width/height
+        dimension_sets = []
+
+        if lwh_columns:
+            # Cubic boxes: lwh, lwh2, etc.
+            for lwh_col in lwh_columns:
+                val = safe_float(lwh_col)
+                if val is not None and val > 0:
+                    dimension_sets.append({
+                        "source": lwh_col,
+                        "length": val,
+                        "width": val,
+                        "height": val
+                    })
+        elif has_manual_dims:
+            # Rectangular box: single set from length/width/height
+            length = safe_float('length')
+            width = safe_float('width')
+            height = safe_float('height')
+            if length and width and height and length > 0 and width > 0 and height > 0:
+                dimension_sets.append({
+                    "source": "manual",
+                    "length": length,
+                    "width": width,
+                    "height": height
+                })
+            else:
+                st.error(f"❌ Row {int(idx) + 2}: Missing or invalid 'length', 'width', or 'height'")
+                return None
+        else:
+            st.error(f"❌ Row {int(idx) + 2}: No valid dimensions found")
+            return None
 
         # Get valid weight values
         weight_values = {}
@@ -275,8 +307,8 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
             weight_values = {"weight": 1.0}
             st.warning(f"⚠️ Row {int(idx) + 2}: No valid weights. Using default = 1.0")  # ✅ FIXED: int(idx)
 
-        # Create package for every lwh-weight combination
-        for lwh_col, lwh_val in lwh_values.items():
+        # Create package for every dimension-weight combination
+        for dim in dimension_sets:
             for weight_col, weight_val in weight_values.items():
                 for box_num in range(num_boxes):
                     unique_shipment_id = str(uuid.uuid4()).replace("-", "")[:16]
@@ -284,15 +316,15 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
                         "SKU": safe_string('sku', "N/A"),
                         "Weight": weight_val,
                         "Description": safe_string('description', "No description"),
-                        "Length": lwh_val,
-                        "Width": lwh_val,
-                        "Height": lwh_val,
+                        "Length": dim["length"],
+                        "Width": dim["width"],
+                        "Height": dim["height"],
                         "PackagingWeight": packaging_weight,
                         "Address": address,
                         "ServiceLevel": service_level,
                         "Carrier": carrier,
                         "ClientCode": row_client_code,
-                        "LWH_Source": lwh_col,
+                        "LWH_Source": dim["source"],
                         "Weight_Source": weight_col,
                         "Box_Index": box_num,
                         "UNIQUE_SHIPMENT_ID": unique_shipment_id,
@@ -497,11 +529,12 @@ def main():
         st.header("📋 Usage Guide")
         st.markdown(f"""
         **Required Columns**: `name`, `services`
-        **Optional Columns**:
-        - `carrier`: Use `RS` for RateShopping, `FEDEX`, `PURO`, or `UPS`
-        - `services`: Leave **blank** for RS, or use codes like `F2`, `P`, `U`
-        - `lwh`, `lwh2`, ...: Box sizes
-        - `weight`, `weight2`, ...: Weights
+        **Box Dimensions** (choose one):
+        - **Cubic**: `lwh`, `lwh2`, `lwh3`, ...
+        - **Rectangular**: `length`, `width`, `height`
+        **Weights**: `weight`, `weight2`, `weight3`, ...
+        **Optional**:
+        - `carrier`: Use `RS` for RateShopping
         - `postal_prefix`: Auto-fills address (e.g., B2J)
         """)
         st.info("✅ RS is triggered by blank `services` OR `carrier = 'RS'`")
