@@ -31,20 +31,18 @@ HEADERS = {
 }
 
 # =========================
-# Carrier Service Mapping — INCLUDING NEW CARRIERS
+# Carrier Service Mapping
 # =========================
 CARRIER_SERVICE_MAP = {
     "FEDEX": {"CarrierCode": "FDXE", "Services": {"F1 - Priority Overnight": "F1", "F2 - Ground": "F2", "F3 - Express Saver": "F3"}},
     "PURO": {"CarrierCode": "PURO", "Services": {"P - Purolator Ground": "P", "PXPU - Purolator Express": "PXPU"}},
     "UPS": {"CarrierCode": "UPS", "Services": {"U - UPS Ground": "U", "EXP1 - UPS Express": "EXP1"}},
     "RS": {"CarrierCode": "RS", "Services": {"RateShopping": ""}},
-    # ✅ NEW CARRIERS ADDED BELOW
     "UNI": {"CarrierCode": "UNIUNI", "Services": {"UNI - Standard": "UNI"}},
     "UBI": {"CarrierCode": "UBI", "Services": {"UBI - Intelcom Domestic": "UBI"}},
     "CANPAR": {"CarrierCode": "CNTL", "Services": {"CPR - Ground": "CPR"}}
 }
 
-# Rebuild SERVICE_TO_CARRIER mapping
 SERVICE_TO_CARRIER = {}
 for carrier, info in CARRIER_SERVICE_MAP.items():
     for service_name, service_code in info["Services"].items():
@@ -95,7 +93,6 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
         clean_columns.append(cleaned)
     df.columns = clean_columns
 
-    # ✅ Drop any empty column names (caused by trailing commas in CSV)
     df = df.loc[:, df.columns != '']
 
     column_mapping = {
@@ -188,7 +185,6 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
     packages = []
 
     for idx, row in df.iterrows():
-        # ✅ FIXED: Use .get() to avoid KeyError on missing columns
         def safe_string(col, default=""): 
             val = row.get(col)
             if pd.isna(val):
@@ -248,7 +244,6 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
             company = user_company or db_entry["company"]
             phone = user_phone or db_entry["phone"]
             email = user_email or db_entry["email"]
-            st.info(f"📍 Auto-filled from DB: {address1}, {city}")
         else:
             address1 = user_address1
             city = user_city
@@ -259,8 +254,6 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
             company = user_company
             phone = user_phone
             email = user_email
-            if postal_prefix:
-                st.warning(f"⚠️ Postal prefix '{postal_prefix}' not found in database")
 
         if not name or not address1 or not city or not postal:
             st.error(f"❌ Row {int(idx) + 2}: Missing required field")
@@ -316,10 +309,7 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
         
         if not weight_values:
             weight_values = {"weight": 1.0}
-            st.warning(f"⚠️ Row {int(idx) + 2}: No valid weights. Using default = 1.0")
 
-        # ✅ FIXED: Create ONE package per CSV row (not per box)
-        # Boxes are included in the payload but don't create separate result rows
         unique_shipment_id = str(uuid.uuid4()).replace("-", "")[:16]
         packages.append({
             "SKU": safe_string('sku', "N/A"),
@@ -333,12 +323,10 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
             "ServiceLevel": service_level,
             "Carrier": carrier,
             "ClientCode": row_client_code,
-            "LWH_Source": dimension_sets[0]["source"] if dimension_sets else "default",
-            "Weight_Source": list(weight_values.keys())[0] if weight_values else "weight",
-            "NumBoxes": num_boxes,  # Store box count but don't multiply rows
+            "NumBoxes": num_boxes,
             "UNIQUE_SHIPMENT_ID": unique_shipment_id,
             "OrderID": user_order_id,
-            "Row_Index": idx  # Track original row
+            "Row_Index": idx
         })
 
     if not packages:
@@ -346,14 +334,11 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
         return None
     return packages, carrier
 
-# ✅ UPDATED: Each order gets its own API call and result row
 def submit_single_shipment(payload, client_code, order_id, batch_id, dry_run=True, num_boxes=1):
     session = create_robust_session()
     original_payload = payload.copy()
     try:
         payload["ClientCode"] = client_code
-        
-        # ✅ Estimate API: add dryRun query parameter (configurable)
         params = {"dryRun": "true" if dry_run else "false"}
         response = session.post(API_URL, headers=HEADERS, json=payload, params=params, timeout=30)
 
@@ -375,7 +360,6 @@ def submit_single_shipment(payload, client_code, order_id, batch_id, dry_run=Tru
                 "ExpectedDelivery": "N/A",
                 "Zone": "N/A",
                 "Error": f"HTTP {response.status_code}: {error_text}",
-                "_original_payload": original_payload,
                 "ClientCode": client_code,
                 "BatchID": batch_id,
                 "DryRun": dry_run
@@ -402,16 +386,13 @@ def submit_single_shipment(payload, client_code, order_id, batch_id, dry_run=Tru
                 "Boxes": num_boxes,
                 "ExpectedDelivery": "N/A",
                 "Zone": "N/A",
-                "_original_payload": original_payload,
                 "ClientCode": client_code,
                 "BatchID": batch_id,
                 "DryRun": dry_run
             }
 
-        # ✅ Parse Rates array from Estimate API response
         rates = response_data.get("Rates")
         if rates and isinstance(rates, list) and len(rates) > 0:
-            # Use the first/best rate (IsBest=true if available)
             best_rate = next((r for r in rates if r.get("IsBest")), rates[0])
             total_cost = best_rate.get("TotalAmount", best_rate.get("Amount", 0))
             service_code = best_rate.get("ServiceCode", payload.get("Routing", {}).get("ServiceCode", "N/A"))
@@ -430,13 +411,12 @@ def submit_single_shipment(payload, client_code, order_id, batch_id, dry_run=Tru
             base_amount = 0
 
         status_text = "✅ Estimate (DryRun)" if dry_run else "✅ Saved to DB"
-        tracking_text = "N/A (Estimate Only)" if dry_run else "See TechSHIP UI"
 
         return {
             "Status": status_text,
             "OrderID": order_id,
             "TransactionNumber": payload.get("TransactionNumber", "N/A"),
-            "TrackingNumber": tracking_text,
+            "TrackingNumber": "N/A (Estimate Only)",
             "Cost": f"${total_cost:.2f}",
             "BaseAmount": f"${base_amount:.2f}",
             "FuelSurcharge": f"${fuel_surcharge:.2f}",
@@ -447,7 +427,6 @@ def submit_single_shipment(payload, client_code, order_id, batch_id, dry_run=Tru
             "Boxes": num_boxes,
             "ExpectedDelivery": expected_delivery,
             "Zone": zone,
-            "_original_payload": original_payload,
             "ClientCode": client_code,
             "BatchID": batch_id,
             "DryRun": dry_run
@@ -470,7 +449,6 @@ def submit_single_shipment(payload, client_code, order_id, batch_id, dry_run=Tru
             "ExpectedDelivery": "N/A",
             "Zone": "N/A",
             "Error": str(e)[:150],
-            "_original_payload": original_payload,
             "ClientCode": client_code,
             "BatchID": batch_id,
             "DryRun": dry_run
@@ -478,10 +456,9 @@ def submit_single_shipment(payload, client_code, order_id, batch_id, dry_run=Tru
     finally:
         session.close()
 
-# ✅ FIXED: NO GROUPING - Each order gets its own result row
-def submit_concurrent_shipments(packages, carrier, fallback_client_code, max_workers=3, override_batch_id=None, dry_run=True):
-    actual_workers = min(max_workers, 4)
-    batch_id = override_batch_id if override_batch_id else str(uuid.uuid4()).replace("-", "")[:20]
+def submit_all_shipments(packages, carrier, fallback_client_code, batch_id, dry_run=True, max_workers=4):
+    """Submit ALL packages and return results - NO batching"""
+    actual_workers = min(max_workers, 8)
     
     payloads = []
     for pkg in packages:
@@ -522,17 +499,20 @@ def submit_concurrent_shipments(packages, carrier, fallback_client_code, max_wor
     
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=actual_workers) as executor:
-        futures = []
-        for payload, client_code_val, order_id, bid, num_boxes in payloads:
-            future = executor.submit(submit_single_shipment, payload, client_code_val, order_id, bid, dry_run, num_boxes)
-            futures.append(future)
-        for future in concurrent.futures.as_completed(futures):
+        futures = [executor.submit(submit_single_shipment, payload, client_code_val, order_id, bid, dry_run, num_boxes) 
+                   for payload, client_code_val, order_id, bid, num_boxes in payloads]
+        
+        # Show progress
+        progress_bar = st.progress(0)
+        for i, future in enumerate(concurrent.futures.as_completed(futures)):
             results.append(future.result())
+            progress_bar.progress((i + 1) / len(futures))
+        
+        progress_bar.empty()
     
-    # ✅ Sort results by OrderID for easy reading
+    # Sort by OrderID
     results.sort(key=lambda x: x.get("OrderID", ""))
-    
-    return results, batch_id
+    return results
 
 def add_selectable_css():
     st.markdown("""
@@ -549,16 +529,14 @@ def add_selectable_css():
 def main():
     add_selectable_css()
     st.title("📦 TechSHIP Bulk Rate Estimator")
-    st.markdown("### Estimate API — All Orders Displayed Individually")
+    st.markdown("### All Orders Displayed - No Batching")
 
     fallback_client_code = st.text_input("Fallback Client Code", value="omrtest1")
     if not fallback_client_code.strip():
         st.warning("⚠️ Please enter a valid Fallback Client Code")
         st.stop()
 
-    # ✅ dryRun Toggle - Control visibility in TechSHIP UI
-    dry_run = st.checkbox("🔒 Dry Run Mode (Estimates Only - Not Saved to DB)", value=True, 
-                          help="If unchecked, estimates will be saved to database and visible in TechSHIP UI")
+    dry_run = st.checkbox("🔒 Dry Run Mode (Estimates Only - Not Saved to DB)", value=True)
 
     col1, col2 = st.columns(2)
     with col1:
@@ -578,19 +556,16 @@ def main():
         - Leave `services` blank → RateShopping (RS)
         **Dimensions**: `lwh` or `length/width/height`  
         **Weights**: `weight`, `weight2`, ...
-        **Optional**: `postal_prefix` for address auto-fill
         """)
-        st.info("✅ Example: carrier=RS, services=(blank) for rate shopping")
         
         if dry_run:
-            st.warning("⚠️ **Dry Run Mode ON** — Estimates NOT saved to database. Won't appear in TechSHIP UI.")
+            st.warning("⚠️ **Dry Run Mode ON** — Estimates NOT saved to database.")
         else:
-            st.success("✅ **Dry Run Mode OFF** — Estimates SAVED to database. Will appear in TechSHIP UI.")
+            st.success("✅ **Dry Run Mode OFF** — Estimates SAVED to database.")
         
         st.markdown("---")
         st.markdown("**🌐 TechSHIP Web Portal:**")
         st.code("https://18wheels.techship.ca/", language="text")
-        st.markdown("Search by `BatchID` or `TransactionNumber` from results below.")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -598,77 +573,54 @@ def main():
     with col2:
         text_input = st.text_area("📋 Or Paste Data", height=150)
 
-    # Initialize session state
-    if "first_results" not in st.session_state:
-        st.session_state.first_results = []
-        st.session_state.background_results = []
-        st.session_state.background_done = False
+    if "all_results" not in st.session_state:
+        st.session_state.all_results = []
         st.session_state.batch_id = ""
-        st.session_state.dry_run = True
         st.session_state.total_orders = 0
+        st.session_state.processing_done = True
 
     if st.button("🚀 Get Rate Estimates", type="primary"):
-        st.session_state.dry_run = dry_run
+        st.session_state.processing_done = False
+        st.session_state.all_results = []
         
         with st.spinner("🔍 Parsing data..."):
             df = parse_input_data(text_input, uploaded_file)
-            if df is None: st.stop()
+            if df is None: 
+                st.session_state.processing_done = True
+                st.stop()
             result = validate_and_process_data(df, fallback_client_code.strip(), force_rs=trigger_rs)
-            if result is None: st.stop()
+            if result is None: 
+                st.session_state.processing_done = True
+                st.stop()
             packages, carrier = result
             st.session_state.total_orders = len(packages)
             st.success(f"✅ Parsed {len(packages)} orders for {carrier}")
 
         st.subheader("⚙️ Configuration")
-        max_workers = st.slider("ParallelGroups", 1, 8, 4)
+        max_workers = st.slider("Parallel Workers", 1, 8, 4)
 
-        # ✅ ONE batch_id for ALL
         batch_id = str(uuid.uuid4()).replace("-", "")[:20]
         st.session_state.batch_id = batch_id
 
-        first_packages = packages[:3]
-        rest_packages = packages[3:]
+        with st.spinner(f"📤 Getting estimates for ALL {len(packages)} orders..."):
+            all_results = submit_all_shipments(
+                packages, carrier, fallback_client_code.strip(),
+                batch_id=batch_id,
+                dry_run=dry_run,
+                max_workers=max_workers
+            )
+            st.session_state.all_results = all_results
+            st.session_state.processing_done = True
 
-        st.session_state.first_results = []
-        st.session_state.background_results = []
-        st.session_state.background_done = False
-
-        # Submit first 3
-        if first_packages:
-            with st.spinner(f"📤 Getting first {len(first_packages)} estimates..."):
-                first_results, _ = submit_concurrent_shipments(
-                    first_packages, carrier, fallback_client_code.strip(),
-                    max_workers=1,
-                    override_batch_id=batch_id,
-                    dry_run=dry_run
-                )
-                st.session_state.first_results = first_results
-
-        # Submit rest in background
-        if rest_packages:
-            def background_task():
-                results, _ = submit_concurrent_shipments(
-                    rest_packages, carrier, fallback_client_code.strip(),
-                    max_workers,
-                    override_batch_id=batch_id,
-                    dry_run=dry_run
-                )
-                st.session_state.background_results = results
-                st.session_state.background_done = True
-
-            thread = threading.Thread(target=background_task, daemon=True)
-            thread.start()
-            st.info(f"⏳ {len(rest_packages)} orders in background. BatchID: `{batch_id[:8]}...`")
-        else:
-            st.session_state.background_done = True
+        st.success(f"✅ Completed! Processed {len(all_results)} orders")
 
     # Display results
-    all_results = st.session_state.first_results + st.session_state.background_results
-    if all_results:
+    if st.session_state.all_results:
+        all_results = st.session_state.all_results
         success_count = sum(1 for r in all_results if "✅" in r.get("Status", ""))
         failed_count = len(all_results) - success_count
 
-        st.subheader("📊 Results")
+        st.subheader("📊 Results - All Orders")
         col1, col2, col3 = st.columns(3)
         col1.metric("Total Orders", st.session_state.total_orders)
         col2.metric("Success", success_count)
@@ -714,20 +666,10 @@ def main():
             "text/csv"
         )
 
-        # ✅ Show TechSHIP UI link with BatchID for easy lookup
-        if not st.session_state.dry_run:
+        if not dry_run:
             st.success(f"✅ **Saved to Database!** View in TechSHIP: [https://18wheels.techship.ca/](https://18wheels.techship.ca/) — Search BatchID: `{st.session_state.batch_id}`")
         else:
             st.info(f"ℹ️ **Dry Run Mode** — Not saved to database. BatchID: `{st.session_state.batch_id}`")
-
-    # Auto-refresh or manual check
-    if not st.session_state.background_done and st.session_state.background_results:
-        time.sleep(1)
-        st.rerun()
-
-    if not st.session_state.background_done and len(st.session_state.first_results) > 0:
-        if st.button("🔄 Check for New Results"):
-            st.rerun()
 
 if __name__ == "__main__":
     main()
