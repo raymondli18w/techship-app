@@ -318,36 +318,36 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
             weight_values = {"weight": 1.0}
             st.warning(f"⚠️ Row {int(idx) + 2}: No valid weights. Using default = 1.0")
 
-        for dim in dimension_sets:
-            for weight_col, weight_val in weight_values.items():
-                for box_num in range(num_boxes):
-                    unique_shipment_id = str(uuid.uuid4()).replace("-", "")[:16]
-                    packages.append({
-                        "SKU": safe_string('sku', "N/A"),
-                        "Weight": weight_val,
-                        "Description": safe_string('description', "No description"),
-                        "Length": dim["length"],
-                        "Width": dim["width"],
-                        "Height": dim["height"],
-                        "PackagingWeight": packaging_weight,
-                        "Address": address,
-                        "ServiceLevel": service_level,
-                        "Carrier": carrier,
-                        "ClientCode": row_client_code,
-                        "LWH_Source": dim["source"],
-                        "Weight_Source": weight_col,
-                        "Box_Index": box_num,
-                        "UNIQUE_SHIPMENT_ID": unique_shipment_id,
-                        "OrderID": user_order_id
-                    })
+        # ✅ FIXED: Create ONE package per CSV row (not per box)
+        # Boxes are included in the payload but don't create separate result rows
+        unique_shipment_id = str(uuid.uuid4()).replace("-", "")[:16]
+        packages.append({
+            "SKU": safe_string('sku', "N/A"),
+            "Weight": list(weight_values.values())[0] if weight_values else 1.0,
+            "Description": safe_string('description', "No description"),
+            "Length": dimension_sets[0]["length"] if dimension_sets else 10,
+            "Width": dimension_sets[0]["width"] if dimension_sets else 10,
+            "Height": dimension_sets[0]["height"] if dimension_sets else 10,
+            "PackagingWeight": packaging_weight,
+            "Address": address,
+            "ServiceLevel": service_level,
+            "Carrier": carrier,
+            "ClientCode": row_client_code,
+            "LWH_Source": dimension_sets[0]["source"] if dimension_sets else "default",
+            "Weight_Source": list(weight_values.keys())[0] if weight_values else "weight",
+            "NumBoxes": num_boxes,  # Store box count but don't multiply rows
+            "UNIQUE_SHIPMENT_ID": unique_shipment_id,
+            "OrderID": user_order_id,
+            "Row_Index": idx  # Track original row
+        })
 
     if not packages:
         st.error("❌ No valid packages created.")
         return None
     return packages, carrier
 
-# ✅ UPDATED: Estimate API with configurable dryRun
-def submit_single_shipment(payload, client_code, order_id, batch_id, dry_run=True):
+# ✅ UPDATED: Each order gets its own API call and result row
+def submit_single_shipment(payload, client_code, order_id, batch_id, dry_run=True, num_boxes=1):
     session = create_robust_session()
     original_payload = payload.copy()
     try:
@@ -361,6 +361,7 @@ def submit_single_shipment(payload, client_code, order_id, batch_id, dry_run=Tru
             error_text = response.text[:200] if response.text else "No details"
             return {
                 "Status": f"❌ HTTP {response.status_code}",
+                "OrderID": order_id,
                 "TransactionNumber": payload.get("TransactionNumber", "N/A"),
                 "TrackingNumber": "N/A",
                 "Cost": "$0.00",
@@ -370,13 +371,12 @@ def submit_single_shipment(payload, client_code, order_id, batch_id, dry_run=Tru
                 "Carrier": payload.get("CarrierCode", "N/A"),
                 "Recipient": payload.get("ShipToAddress", {}).get("Name", "N/A"),
                 "PostalCode": payload.get("ShipToAddress", {}).get("Postal", "N/A"),
-                "Boxes": len(payload.get("Packages", [])),
+                "Boxes": num_boxes,
                 "ExpectedDelivery": "N/A",
                 "Zone": "N/A",
                 "Error": f"HTTP {response.status_code}: {error_text}",
                 "_original_payload": original_payload,
                 "ClientCode": client_code,
-                "OrderID": order_id,
                 "BatchID": batch_id,
                 "DryRun": dry_run
             }
@@ -389,6 +389,7 @@ def submit_single_shipment(payload, client_code, order_id, batch_id, dry_run=Tru
             return {
                 "Status": "❌ Invalid JSON",
                 "Error": "Response was not valid JSON",
+                "OrderID": order_id,
                 "TransactionNumber": payload.get("TransactionNumber", "N/A"),
                 "TrackingNumber": "N/A",
                 "Cost": "$0.00",
@@ -398,12 +399,11 @@ def submit_single_shipment(payload, client_code, order_id, batch_id, dry_run=Tru
                 "Carrier": payload.get("CarrierCode", "N/A"),
                 "Recipient": payload.get("ShipToAddress", {}).get("Name", "N/A"),
                 "PostalCode": payload.get("ShipToAddress", {}).get("Postal", "N/A"),
-                "Boxes": len(payload.get("Packages", [])),
+                "Boxes": num_boxes,
                 "ExpectedDelivery": "N/A",
                 "Zone": "N/A",
                 "_original_payload": original_payload,
                 "ClientCode": client_code,
-                "OrderID": order_id,
                 "BatchID": batch_id,
                 "DryRun": dry_run
             }
@@ -434,6 +434,7 @@ def submit_single_shipment(payload, client_code, order_id, batch_id, dry_run=Tru
 
         return {
             "Status": status_text,
+            "OrderID": order_id,
             "TransactionNumber": payload.get("TransactionNumber", "N/A"),
             "TrackingNumber": tracking_text,
             "Cost": f"${total_cost:.2f}",
@@ -443,12 +444,11 @@ def submit_single_shipment(payload, client_code, order_id, batch_id, dry_run=Tru
             "Carrier": payload.get("CarrierCode", "N/A"),
             "Recipient": payload["ShipToAddress"]["Name"],
             "PostalCode": payload["ShipToAddress"]["Postal"],
-            "Boxes": len(payload["Packages"]),
+            "Boxes": num_boxes,
             "ExpectedDelivery": expected_delivery,
             "Zone": zone,
             "_original_payload": original_payload,
             "ClientCode": client_code,
-            "OrderID": order_id,
             "BatchID": batch_id,
             "DryRun": dry_run
         }
@@ -456,6 +456,7 @@ def submit_single_shipment(payload, client_code, order_id, batch_id, dry_run=Tru
     except Exception as e:
         return {
             "Status": "❌ Failed",
+            "OrderID": order_id,
             "TransactionNumber": payload.get("TransactionNumber", "unknown"),
             "TrackingNumber": "N/A",
             "Cost": "$0.00",
@@ -465,43 +466,26 @@ def submit_single_shipment(payload, client_code, order_id, batch_id, dry_run=Tru
             "Carrier": payload.get("CarrierCode", "unknown"),
             "Recipient": payload.get("ShipToAddress", {}).get("Name", "unknown"),
             "PostalCode": payload.get("ShipToAddress", {}).get("Postal", "unknown"),
-            "Boxes": len(payload.get("Packages", [])),
+            "Boxes": num_boxes,
             "ExpectedDelivery": "N/A",
             "Zone": "N/A",
             "Error": str(e)[:150],
             "_original_payload": original_payload,
             "ClientCode": client_code,
-            "OrderID": order_id,
             "BatchID": batch_id,
             "DryRun": dry_run
         }
     finally:
         session.close()
 
-# ✅ Accepts override_batch_id for shared batch
+# ✅ FIXED: NO GROUPING - Each order gets its own result row
 def submit_concurrent_shipments(packages, carrier, fallback_client_code, max_workers=3, override_batch_id=None, dry_run=True):
     actual_workers = min(max_workers, 4)
-    shipment_groups = defaultdict(list)
-    for package in packages:
-        key = (
-            package["Address"]["Name"],
-            package["Address"]["Address1"], 
-            package["Address"]["City"],
-            package["Address"]["Postal"],
-            package["ServiceLevel"],
-            package["Length"],
-            package["Width"], 
-            package["Height"],
-            package["Weight"],
-            package["PackagingWeight"]
-        )
-        shipment_groups[key].append(package)
-    
     batch_id = override_batch_id if override_batch_id else str(uuid.uuid4()).replace("-", "")[:20]
     
     payloads = []
-    for key, package_group in shipment_groups.items():
-        customer_order = package_group[0].get("OrderID", str(uuid.uuid4()).replace("-", "")[:20])[:20]
+    for pkg in packages:
+        customer_order = pkg.get("OrderID", str(uuid.uuid4()).replace("-", "")[:20])[:20]
         transaction_number = str(uuid.uuid4()).replace("-", "")[:20]
         
         payload = {
@@ -511,17 +495,11 @@ def submit_concurrent_shipments(packages, carrier, fallback_client_code, max_wor
             "CarrierCode": CARRIER_SERVICE_MAP[carrier]["CarrierCode"],
             "Routing": {
                 "CarrierCode": CARRIER_SERVICE_MAP[carrier]["CarrierCode"],
-                "ServiceCode": package_group[0]["ServiceLevel"],
+                "ServiceCode": pkg["ServiceLevel"],
                 "FreightPaymentTerms": "Prepaid"
             },
-            "ShipToAddress": package_group[0]["Address"],
-            "Packages": []
-        }
-        
-        client_code_val = package_group[0].get("ClientCode") or fallback_client_code
-        
-        for pkg in package_group:
-            payload["Packages"].append({
+            "ShipToAddress": pkg["Address"],
+            "Packages": [{
                 "Weight": pkg["Weight"],
                 "Dimensions": {
                     "Length": pkg["Length"],
@@ -534,17 +512,26 @@ def submit_concurrent_shipments(packages, carrier, fallback_client_code, max_wor
                     "Description": pkg["Description"],
                     "Quantity": 1
                 }]
-            })
-        payloads.append((payload, client_code_val, customer_order, batch_id))
+            }]
+        }
+        
+        client_code_val = pkg.get("ClientCode") or fallback_client_code
+        num_boxes = pkg.get("NumBoxes", 1)
+        
+        payloads.append((payload, client_code_val, customer_order, batch_id, num_boxes))
     
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=actual_workers) as executor:
         futures = []
-        for payload, client_code_val, order_id, bid in payloads:
-            future = executor.submit(submit_single_shipment, payload, client_code_val, order_id, bid, dry_run)
+        for payload, client_code_val, order_id, bid, num_boxes in payloads:
+            future = executor.submit(submit_single_shipment, payload, client_code_val, order_id, bid, dry_run, num_boxes)
             futures.append(future)
         for future in concurrent.futures.as_completed(futures):
             results.append(future.result())
+    
+    # ✅ Sort results by OrderID for easy reading
+    results.sort(key=lambda x: x.get("OrderID", ""))
+    
     return results, batch_id
 
 def add_selectable_css():
@@ -562,7 +549,7 @@ def add_selectable_css():
 def main():
     add_selectable_css()
     st.title("📦 TechSHIP Bulk Rate Estimator")
-    st.markdown("### Estimate API — View in TechSHIP UI")
+    st.markdown("### Estimate API — All Orders Displayed Individually")
 
     fallback_client_code = st.text_input("Fallback Client Code", value="omrtest1")
     if not fallback_client_code.strip():
@@ -618,6 +605,7 @@ def main():
         st.session_state.background_done = False
         st.session_state.batch_id = ""
         st.session_state.dry_run = True
+        st.session_state.total_orders = 0
 
     if st.button("🚀 Get Rate Estimates", type="primary"):
         st.session_state.dry_run = dry_run
@@ -628,10 +616,11 @@ def main():
             result = validate_and_process_data(df, fallback_client_code.strip(), force_rs=trigger_rs)
             if result is None: st.stop()
             packages, carrier = result
-            st.success(f"✅ Parsed {len(packages)} packages for {carrier}")
+            st.session_state.total_orders = len(packages)
+            st.success(f"✅ Parsed {len(packages)} orders for {carrier}")
 
         st.subheader("⚙️ Configuration")
-        max_workers = st.slider("ParallelGroups", 1, 4, 3)
+        max_workers = st.slider("ParallelGroups", 1, 8, 4)
 
         # ✅ ONE batch_id for ALL
         batch_id = str(uuid.uuid4()).replace("-", "")[:20]
@@ -681,15 +670,15 @@ def main():
 
         st.subheader("📊 Results")
         col1, col2, col3 = st.columns(3)
-        col1.metric("Total", len(all_results))
+        col1.metric("Total Orders", st.session_state.total_orders)
         col2.metric("Success", success_count)
         col3.metric("Failed", failed_count)
 
         display_data = []
         for r in all_results:
             row = {
-                "Status": r.get("Status", "Unknown"),
                 "OrderID": r.get("OrderID", "N/A"),
+                "Status": r.get("Status", "Unknown"),
                 "BatchID": r.get("BatchID", "N/A"),
                 "TransactionNumber": r.get("TransactionNumber", "N/A"),
                 "Boxes": r.get("Boxes", 0),
@@ -709,7 +698,7 @@ def main():
         
         results_df = pd.DataFrame(display_data)
         display_cols = [
-            "Status", "OrderID", "BatchID", "TransactionNumber",
+            "OrderID", "Status", "BatchID", "TransactionNumber",
             "Boxes", "Cost", "BaseAmount", "FuelSurcharge", "Service", "Carrier",
             "Recipient", "PostalCode", "ExpectedDelivery", "Zone"
         ]
