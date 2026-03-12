@@ -19,7 +19,7 @@ from sqlite_lookup import get_address_by_prefix
 st.set_page_config(page_title="TechSHIP Bulk Rate Estimator", page_icon="📦", layout="wide")
 
 # =========================
-# TechSHIP API Configuration (ESTIMATE ONLY - dryRun=true)
+# TechSHIP API Configuration (ESTIMATE API)
 # =========================
 API_URL = "https://18wheels.techship.ca/api/v3/shipments/estimate"
 API_KEY = "bfdcbf84-f76d-b85b-8eae-fa925d6fa863"
@@ -346,15 +346,15 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
         return None
     return packages, carrier
 
-# ✅ UPDATED: Estimate API with dryRun=true
-def submit_single_shipment(payload, client_code, order_id, batch_id):
+# ✅ UPDATED: Estimate API with configurable dryRun
+def submit_single_shipment(payload, client_code, order_id, batch_id, dry_run=True):
     session = create_robust_session()
     original_payload = payload.copy()
     try:
         payload["ClientCode"] = client_code
         
-        # ✅ Estimate API: add dryRun=true query parameter
-        params = {"dryRun": "true"}
+        # ✅ Estimate API: add dryRun query parameter (configurable)
+        params = {"dryRun": "true" if dry_run else "false"}
         response = session.post(API_URL, headers=HEADERS, json=payload, params=params, timeout=30)
 
         if response.status_code != 200:
@@ -362,9 +362,12 @@ def submit_single_shipment(payload, client_code, order_id, batch_id):
             return {
                 "Status": f"❌ HTTP {response.status_code}",
                 "TransactionNumber": payload.get("TransactionNumber", "N/A"),
-                "TrackingNumber": "N/A (Estimate Only)",
+                "TrackingNumber": "N/A",
                 "Cost": "$0.00",
+                "BaseAmount": "$0.00",
+                "FuelSurcharge": "$0.00",
                 "Service": payload.get("Routing", {}).get("ServiceCode", "N/A"),
+                "Carrier": payload.get("CarrierCode", "N/A"),
                 "Recipient": payload.get("ShipToAddress", {}).get("Name", "N/A"),
                 "PostalCode": payload.get("ShipToAddress", {}).get("Postal", "N/A"),
                 "Boxes": len(payload.get("Packages", [])),
@@ -374,7 +377,8 @@ def submit_single_shipment(payload, client_code, order_id, batch_id):
                 "_original_payload": original_payload,
                 "ClientCode": client_code,
                 "OrderID": order_id,
-                "BatchID": batch_id
+                "BatchID": batch_id,
+                "DryRun": dry_run
             }
 
         try:
@@ -386,9 +390,12 @@ def submit_single_shipment(payload, client_code, order_id, batch_id):
                 "Status": "❌ Invalid JSON",
                 "Error": "Response was not valid JSON",
                 "TransactionNumber": payload.get("TransactionNumber", "N/A"),
-                "TrackingNumber": "N/A (Estimate Only)",
+                "TrackingNumber": "N/A",
                 "Cost": "$0.00",
+                "BaseAmount": "$0.00",
+                "FuelSurcharge": "$0.00",
                 "Service": payload.get("Routing", {}).get("ServiceCode", "N/A"),
+                "Carrier": payload.get("CarrierCode", "N/A"),
                 "Recipient": payload.get("ShipToAddress", {}).get("Name", "N/A"),
                 "PostalCode": payload.get("ShipToAddress", {}).get("Postal", "N/A"),
                 "Boxes": len(payload.get("Packages", [])),
@@ -397,7 +404,8 @@ def submit_single_shipment(payload, client_code, order_id, batch_id):
                 "_original_payload": original_payload,
                 "ClientCode": client_code,
                 "OrderID": order_id,
-                "BatchID": batch_id
+                "BatchID": batch_id,
+                "DryRun": dry_run
             }
 
         # ✅ Parse Rates array from Estimate API response
@@ -421,33 +429,40 @@ def submit_single_shipment(payload, client_code, order_id, batch_id):
             fuel_surcharge = 0
             base_amount = 0
 
+        status_text = "✅ Estimate (DryRun)" if dry_run else "✅ Saved to DB"
+        tracking_text = "N/A (Estimate Only)" if dry_run else "See TechSHIP UI"
+
         return {
-            "Status": "✅ Estimate Ready",
+            "Status": status_text,
             "TransactionNumber": payload.get("TransactionNumber", "N/A"),
-            "TrackingNumber": "N/A (Estimate Only)",
+            "TrackingNumber": tracking_text,
             "Cost": f"${total_cost:.2f}",
             "BaseAmount": f"${base_amount:.2f}",
             "FuelSurcharge": f"${fuel_surcharge:.2f}",
             "Service": f"{service_name} ({service_code})",
+            "Carrier": payload.get("CarrierCode", "N/A"),
             "Recipient": payload["ShipToAddress"]["Name"],
             "PostalCode": payload["ShipToAddress"]["Postal"],
             "Boxes": len(payload["Packages"]),
             "ExpectedDelivery": expected_delivery,
             "Zone": zone,
-            "CarrierCode": payload.get("CarrierCode", "N/A"),
             "_original_payload": original_payload,
             "ClientCode": client_code,
             "OrderID": order_id,
-            "BatchID": batch_id
+            "BatchID": batch_id,
+            "DryRun": dry_run
         }
 
     except Exception as e:
         return {
             "Status": "❌ Failed",
             "TransactionNumber": payload.get("TransactionNumber", "unknown"),
-            "TrackingNumber": "N/A (Estimate Only)",
+            "TrackingNumber": "N/A",
             "Cost": "$0.00",
+            "BaseAmount": "$0.00",
+            "FuelSurcharge": "$0.00",
             "Service": payload.get("Routing", {}).get("ServiceCode", "unknown"),
+            "Carrier": payload.get("CarrierCode", "unknown"),
             "Recipient": payload.get("ShipToAddress", {}).get("Name", "unknown"),
             "PostalCode": payload.get("ShipToAddress", {}).get("Postal", "unknown"),
             "Boxes": len(payload.get("Packages", [])),
@@ -457,13 +472,14 @@ def submit_single_shipment(payload, client_code, order_id, batch_id):
             "_original_payload": original_payload,
             "ClientCode": client_code,
             "OrderID": order_id,
-            "BatchID": batch_id
+            "BatchID": batch_id,
+            "DryRun": dry_run
         }
     finally:
         session.close()
 
 # ✅ Accepts override_batch_id for shared batch
-def submit_concurrent_shipments(packages, carrier, fallback_client_code, max_workers=3, override_batch_id=None):
+def submit_concurrent_shipments(packages, carrier, fallback_client_code, max_workers=3, override_batch_id=None, dry_run=True):
     actual_workers = min(max_workers, 4)
     shipment_groups = defaultdict(list)
     for package in packages:
@@ -525,7 +541,7 @@ def submit_concurrent_shipments(packages, carrier, fallback_client_code, max_wor
     with concurrent.futures.ThreadPoolExecutor(max_workers=actual_workers) as executor:
         futures = []
         for payload, client_code_val, order_id, bid in payloads:
-            future = executor.submit(submit_single_shipment, payload, client_code_val, order_id, bid)
+            future = executor.submit(submit_single_shipment, payload, client_code_val, order_id, bid, dry_run)
             futures.append(future)
         for future in concurrent.futures.as_completed(futures):
             results.append(future.result())
@@ -546,12 +562,16 @@ def add_selectable_css():
 def main():
     add_selectable_css()
     st.title("📦 TechSHIP Bulk Rate Estimator")
-    st.markdown("### Estimate API Mode — dryRun=true (No Labels Created)")
+    st.markdown("### Estimate API — View in TechSHIP UI")
 
     fallback_client_code = st.text_input("Fallback Client Code", value="omrtest1")
     if not fallback_client_code.strip():
         st.warning("⚠️ Please enter a valid Fallback Client Code")
         st.stop()
+
+    # ✅ dryRun Toggle - Control visibility in TechSHIP UI
+    dry_run = st.checkbox("🔒 Dry Run Mode (Estimates Only - Not Saved to DB)", value=True, 
+                          help="If unchecked, estimates will be saved to database and visible in TechSHIP UI")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -574,7 +594,16 @@ def main():
         **Optional**: `postal_prefix` for address auto-fill
         """)
         st.info("✅ Example: carrier=RS, services=(blank) for rate shopping")
-        st.warning("⚠️ This tool uses **dryRun=true** — estimates only, no shipments created")
+        
+        if dry_run:
+            st.warning("⚠️ **Dry Run Mode ON** — Estimates NOT saved to database. Won't appear in TechSHIP UI.")
+        else:
+            st.success("✅ **Dry Run Mode OFF** — Estimates SAVED to database. Will appear in TechSHIP UI.")
+        
+        st.markdown("---")
+        st.markdown("**🌐 TechSHIP Web Portal:**")
+        st.code("https://18wheels.techship.ca/", language="text")
+        st.markdown("Search by `BatchID` or `TransactionNumber` from results below.")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -588,8 +617,11 @@ def main():
         st.session_state.background_results = []
         st.session_state.background_done = False
         st.session_state.batch_id = ""
+        st.session_state.dry_run = True
 
     if st.button("🚀 Get Rate Estimates", type="primary"):
+        st.session_state.dry_run = dry_run
+        
         with st.spinner("🔍 Parsing data..."):
             df = parse_input_data(text_input, uploaded_file)
             if df is None: st.stop()
@@ -618,7 +650,8 @@ def main():
                 first_results, _ = submit_concurrent_shipments(
                     first_packages, carrier, fallback_client_code.strip(),
                     max_workers=1,
-                    override_batch_id=batch_id
+                    override_batch_id=batch_id,
+                    dry_run=dry_run
                 )
                 st.session_state.first_results = first_results
 
@@ -628,7 +661,8 @@ def main():
                 results, _ = submit_concurrent_shipments(
                     rest_packages, carrier, fallback_client_code.strip(),
                     max_workers,
-                    override_batch_id=batch_id
+                    override_batch_id=batch_id,
+                    dry_run=dry_run
                 )
                 st.session_state.background_results = results
                 st.session_state.background_done = True
@@ -642,13 +676,13 @@ def main():
     # Display results
     all_results = st.session_state.first_results + st.session_state.background_results
     if all_results:
-        success_count = sum(1 for r in all_results if "Estimate" in r.get("Status", "") or "Success" in r.get("Status", ""))
+        success_count = sum(1 for r in all_results if "✅" in r.get("Status", ""))
         failed_count = len(all_results) - success_count
 
         st.subheader("📊 Results")
         col1, col2, col3 = st.columns(3)
         col1.metric("Total", len(all_results))
-        col2.metric("Estimates Ready", success_count)
+        col2.metric("Success", success_count)
         col3.metric("Failed", failed_count)
 
         display_data = []
@@ -663,7 +697,7 @@ def main():
                 "BaseAmount": r.get("BaseAmount", ""),
                 "FuelSurcharge": r.get("FuelSurcharge", ""),
                 "Service": r.get("Service", ""),
-                "Carrier": r.get("CarrierCode", ""),
+                "Carrier": r.get("Carrier", ""),
                 "Recipient": r.get("Recipient", ""),
                 "PostalCode": r.get("PostalCode", ""),
                 "ExpectedDelivery": r.get("ExpectedDelivery", "N/A"),
@@ -690,6 +724,12 @@ def main():
             f"techship_estimates_{st.session_state.batch_id}.csv",
             "text/csv"
         )
+
+        # ✅ Show TechSHIP UI link with BatchID for easy lookup
+        if not st.session_state.dry_run:
+            st.success(f"✅ **Saved to Database!** View in TechSHIP: [https://18wheels.techship.ca/](https://18wheels.techship.ca/) — Search BatchID: `{st.session_state.batch_id}`")
+        else:
+            st.info(f"ℹ️ **Dry Run Mode** — Not saved to database. BatchID: `{st.session_state.batch_id}`")
 
     # Auto-refresh or manual check
     if not st.session_state.background_done and st.session_state.background_results:
