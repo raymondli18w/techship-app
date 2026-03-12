@@ -19,7 +19,7 @@ from sqlite_lookup import get_address_by_prefix
 st.set_page_config(page_title="TechSHIP Bulk Rate Estimator", page_icon="📦", layout="wide")
 
 # =========================
-# TechSHIP API Configuration (ESTIMATE ONLY - NO LABELS, NO CHARGES)
+# TechSHIP API Configuration (ESTIMATE ONLY - dryRun=true)
 # =========================
 API_URL = "https://18wheels.techship.ca/api/v3/shipments/estimate"
 API_KEY = "bfdcbf84-f76d-b85b-8eae-fa925d6fa863"
@@ -95,6 +95,9 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
         clean_columns.append(cleaned)
     df.columns = clean_columns
 
+    # ✅ Drop any empty column names (caused by trailing commas in CSV)
+    df = df.loc[:, df.columns != '']
+
     column_mapping = {
         'Services': 'services', 'service': 'services', 'service_code': 'services',
         'address1': 'address', 'street': 'address', 'street1': 'address',
@@ -119,9 +122,6 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
         'height': 'height'
     }
     df.columns = [column_mapping.get(col, col) for col in df.columns]
-
-    # ✅ Drop any empty column names (caused by trailing commas in CSV)
-    df = df.loc[:, df.columns != '']
 
     essential_columns = ['name', 'services']
     missing_columns = [col for col in essential_columns if col not in df.columns]
@@ -233,7 +233,6 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
         num_boxes = safe_int('boxes', 1)
         row_client_code = safe_string('client_code') or fallback_client_code
 
-        # ✅ postal_prefix is optional - safe_string handles missing column
         postal_prefix = safe_string('postal_prefix')
         db_entry = None
         if postal_prefix and len(postal_prefix) >= 3:
@@ -274,8 +273,8 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
             "Address2": user_address2,
             "City": city,
             "StateProvince": province,
-            "Country": country,
             "Postal": postal.replace(" ", "").upper(),
+            "Country": country,
             "Phone": phone,
             "Email": email
         }
@@ -347,24 +346,30 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
         return None
     return packages, carrier
 
+# ✅ UPDATED: Estimate API with dryRun=true
 def submit_single_shipment(payload, client_code, order_id, batch_id):
     session = create_robust_session()
     original_payload = payload.copy()
     try:
         payload["ClientCode"] = client_code
-        response = session.post(API_URL, headers=HEADERS, json=payload, timeout=30)
+        
+        # ✅ Estimate API: add dryRun=true query parameter
+        params = {"dryRun": "true"}
+        response = session.post(API_URL, headers=HEADERS, json=payload, params=params, timeout=30)
 
         if response.status_code != 200:
             error_text = response.text[:200] if response.text else "No details"
             return {
                 "Status": f"❌ HTTP {response.status_code}",
                 "TransactionNumber": payload.get("TransactionNumber", "N/A"),
-                "TrackingNumber": "N/A",
+                "TrackingNumber": "N/A (Estimate Only)",
                 "Cost": "$0.00",
                 "Service": payload.get("Routing", {}).get("ServiceCode", "N/A"),
                 "Recipient": payload.get("ShipToAddress", {}).get("Name", "N/A"),
                 "PostalCode": payload.get("ShipToAddress", {}).get("Postal", "N/A"),
                 "Boxes": len(payload.get("Packages", [])),
+                "ExpectedDelivery": "N/A",
+                "Zone": "N/A",
                 "Error": f"HTTP {response.status_code}: {error_text}",
                 "_original_payload": original_payload,
                 "ClientCode": client_code,
@@ -381,37 +386,55 @@ def submit_single_shipment(payload, client_code, order_id, batch_id):
                 "Status": "❌ Invalid JSON",
                 "Error": "Response was not valid JSON",
                 "TransactionNumber": payload.get("TransactionNumber", "N/A"),
-                "TrackingNumber": "N/A",
+                "TrackingNumber": "N/A (Estimate Only)",
                 "Cost": "$0.00",
                 "Service": payload.get("Routing", {}).get("ServiceCode", "N/A"),
                 "Recipient": payload.get("ShipToAddress", {}).get("Name", "N/A"),
                 "PostalCode": payload.get("ShipToAddress", {}).get("Postal", "N/A"),
                 "Boxes": len(payload.get("Packages", [])),
+                "ExpectedDelivery": "N/A",
+                "Zone": "N/A",
                 "_original_payload": original_payload,
                 "ClientCode": client_code,
                 "OrderID": order_id,
                 "BatchID": batch_id
             }
 
+        # ✅ Parse Rates array from Estimate API response
         rates = response_data.get("Rates")
         if rates and isinstance(rates, list) and len(rates) > 0:
-            rate = rates[0]
-            total_cost = rate.get("TotalCharge", 0)
-            service_code = rate.get("ServiceCode", payload.get("Routing", {}).get("ServiceCode", "N/A"))
+            # Use the first/best rate (IsBest=true if available)
+            best_rate = next((r for r in rates if r.get("IsBest")), rates[0])
+            total_cost = best_rate.get("TotalAmount", best_rate.get("Amount", 0))
+            service_code = best_rate.get("ServiceCode", payload.get("Routing", {}).get("ServiceCode", "N/A"))
+            service_name = best_rate.get("ServiceName", service_code)
+            expected_delivery = best_rate.get("ExpectedDeliveryDate", "N/A")
+            zone = best_rate.get("Zone", "N/A")
+            fuel_surcharge = best_rate.get("FuelSurcharge", 0)
+            base_amount = best_rate.get("BaseAmount", 0)
         else:
             total_cost = 0
             service_code = payload.get("Routing", {}).get("ServiceCode", "N/A")
+            service_name = service_code
+            expected_delivery = "N/A"
+            zone = "N/A"
+            fuel_surcharge = 0
+            base_amount = 0
 
         return {
-            "Status": "✅ Success",
+            "Status": "✅ Estimate Ready",
             "TransactionNumber": payload.get("TransactionNumber", "N/A"),
-            "TrackingNumber": "N/A (Estimate)",
+            "TrackingNumber": "N/A (Estimate Only)",
             "Cost": f"${total_cost:.2f}",
-            "Service": service_code,
+            "BaseAmount": f"${base_amount:.2f}",
+            "FuelSurcharge": f"${fuel_surcharge:.2f}",
+            "Service": f"{service_name} ({service_code})",
             "Recipient": payload["ShipToAddress"]["Name"],
             "PostalCode": payload["ShipToAddress"]["Postal"],
             "Boxes": len(payload["Packages"]),
-            "LabelURL": "",
+            "ExpectedDelivery": expected_delivery,
+            "Zone": zone,
+            "CarrierCode": payload.get("CarrierCode", "N/A"),
             "_original_payload": original_payload,
             "ClientCode": client_code,
             "OrderID": order_id,
@@ -422,12 +445,14 @@ def submit_single_shipment(payload, client_code, order_id, batch_id):
         return {
             "Status": "❌ Failed",
             "TransactionNumber": payload.get("TransactionNumber", "unknown"),
-            "TrackingNumber": "N/A",
+            "TrackingNumber": "N/A (Estimate Only)",
             "Cost": "$0.00",
             "Service": payload.get("Routing", {}).get("ServiceCode", "unknown"),
             "Recipient": payload.get("ShipToAddress", {}).get("Name", "unknown"),
             "PostalCode": payload.get("ShipToAddress", {}).get("Postal", "unknown"),
             "Boxes": len(payload.get("Packages", [])),
+            "ExpectedDelivery": "N/A",
+            "Zone": "N/A",
             "Error": str(e)[:150],
             "_original_payload": original_payload,
             "ClientCode": client_code,
@@ -521,7 +546,7 @@ def add_selectable_css():
 def main():
     add_selectable_css()
     st.title("📦 TechSHIP Bulk Rate Estimator")
-    st.markdown("### First 3 ready fast — all orders share one batch")
+    st.markdown("### Estimate API Mode — dryRun=true (No Labels Created)")
 
     fallback_client_code = st.text_input("Fallback Client Code", value="omrtest1")
     if not fallback_client_code.strip():
@@ -548,7 +573,8 @@ def main():
         **Weights**: `weight`, `weight2`, ...
         **Optional**: `postal_prefix` for address auto-fill
         """)
-        st.info("✅ Example: carrier=UNI, services=UNI")
+        st.info("✅ Example: carrier=RS, services=(blank) for rate shopping")
+        st.warning("⚠️ This tool uses **dryRun=true** — estimates only, no shipments created")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -616,13 +642,13 @@ def main():
     # Display results
     all_results = st.session_state.first_results + st.session_state.background_results
     if all_results:
-        success_count = sum(1 for r in all_results if "Success" in r.get("Status", ""))
+        success_count = sum(1 for r in all_results if "Estimate" in r.get("Status", "") or "Success" in r.get("Status", ""))
         failed_count = len(all_results) - success_count
 
         st.subheader("📊 Results")
         col1, col2, col3 = st.columns(3)
         col1.metric("Total", len(all_results))
-        col2.metric("Success", success_count)
+        col2.metric("Estimates Ready", success_count)
         col3.metric("Failed", failed_count)
 
         display_data = []
@@ -633,11 +659,15 @@ def main():
                 "BatchID": r.get("BatchID", "N/A"),
                 "TransactionNumber": r.get("TransactionNumber", "N/A"),
                 "Boxes": r.get("Boxes", 0),
-                "TrackingNumber": r.get("TrackingNumber", ""),
                 "Cost": r.get("Cost", "$0.00"),
+                "BaseAmount": r.get("BaseAmount", ""),
+                "FuelSurcharge": r.get("FuelSurcharge", ""),
                 "Service": r.get("Service", ""),
+                "Carrier": r.get("CarrierCode", ""),
                 "Recipient": r.get("Recipient", ""),
-                "PostalCode": r.get("PostalCode", "")
+                "PostalCode": r.get("PostalCode", ""),
+                "ExpectedDelivery": r.get("ExpectedDelivery", "N/A"),
+                "Zone": r.get("Zone", "N/A")
             }
             if "Error" in r:
                 row["Error"] = r["Error"]
@@ -646,7 +676,8 @@ def main():
         results_df = pd.DataFrame(display_data)
         display_cols = [
             "Status", "OrderID", "BatchID", "TransactionNumber",
-            "Boxes", "TrackingNumber", "Cost", "Service", "Recipient", "PostalCode"
+            "Boxes", "Cost", "BaseAmount", "FuelSurcharge", "Service", "Carrier",
+            "Recipient", "PostalCode", "ExpectedDelivery", "Zone"
         ]
         if "Error" in results_df.columns:
             display_cols.append("Error")
@@ -654,7 +685,7 @@ def main():
 
         csv = results_df.to_csv(index=False).encode('utf-8')
         st.download_button(
-            "💾 Download All Results",
+            "💾 Download All Estimates",
             csv,
             f"techship_estimates_{st.session_state.batch_id}.csv",
             "text/csv"
