@@ -120,6 +120,9 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
     }
     df.columns = [column_mapping.get(col, col) for col in df.columns]
 
+    # ✅ Drop any empty column names (caused by trailing commas in CSV)
+    df = df.loc[:, df.columns != '']
+
     essential_columns = ['name', 'services']
     missing_columns = [col for col in essential_columns if col not in df.columns]
     if missing_columns:
@@ -146,7 +149,7 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
     
     for idx, row in df.iterrows():
         carrier_val = carrier_col.iloc[idx] if idx < len(carrier_col) else ""
-        service_val = str(row['services']).strip() if pd.notna(row['services']) else ""
+        service_val = str(row.get('services')).strip() if pd.notna(row.get('services')) else ""
         
         if carrier_val == "RS" or service_val == "":
             detected_carriers.add("RS")
@@ -185,13 +188,30 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
     packages = []
 
     for idx, row in df.iterrows():
-        def safe_string(col, default=""): return str(row[col]).strip() if pd.notna(row[col]) else default
+        # ✅ FIXED: Use .get() to avoid KeyError on missing columns
+        def safe_string(col, default=""): 
+            val = row.get(col)
+            if pd.isna(val):
+                return default
+            return str(val).strip()
+        
         def safe_float(col, default=None):
-            try: return float(row[col]) if pd.notna(row[col]) else default
-            except (ValueError, TypeError): return default
+            val = row.get(col)
+            if pd.isna(val):
+                return default
+            try:
+                return float(val)
+            except (ValueError, TypeError):
+                return default
+        
         def safe_int(col, default=1):
-            try: val = int(row[col]) if pd.notna(row[col]) else default; return max(1, val)
-            except (ValueError, TypeError): return default
+            val = row.get(col)
+            if pd.isna(val):
+                return default
+            try:
+                return max(1, int(val))
+            except (ValueError, TypeError):
+                return default
 
         user_name = safe_string('name')
         user_company = safe_string('company')
@@ -203,7 +223,7 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
         user_postal = safe_string('postal')
         user_phone = safe_string('phone')
         user_email = safe_string('email')
-        service_level = row['resolved_service']
+        service_level = row.get('resolved_service', '')
         
         user_order_id = safe_string('order_id')
         if not user_order_id:
@@ -213,6 +233,7 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
         num_boxes = safe_int('boxes', 1)
         row_client_code = safe_string('client_code') or fallback_client_code
 
+        # ✅ postal_prefix is optional - safe_string handles missing column
         postal_prefix = safe_string('postal_prefix')
         db_entry = None
         if postal_prefix and len(postal_prefix) >= 3:
@@ -525,6 +546,7 @@ def main():
         - Leave `services` blank → RateShopping (RS)
         **Dimensions**: `lwh` or `length/width/height`  
         **Weights**: `weight`, `weight2`, ...
+        **Optional**: `postal_prefix` for address auto-fill
         """)
         st.info("✅ Example: carrier=UNI, services=UNI")
 
