@@ -82,7 +82,7 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
         response = session.post(API_URL, headers=HEADERS, json=payload, params=params, timeout=timeout)
 
         if response.status_code != 200:
-            error_text = response.text[:200] if response.text else "No details"
+            error_text = response.text[:300] if response.text else "No details"
             return {
                 "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
                 "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
@@ -116,10 +116,12 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
                 "boxes": len(payload.get("Packages", [])), "chunk_num": chunk_num, "total_chunks": total_chunks
             }
         else:
+            # ✅ Better error message showing WHY no rates
             return {
                 "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
                 "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
-                "error": "No rates returned", "boxes": len(payload.get("Packages", [])),
+                "error": f"No rates returned. Check: Address valid? Service code correct? Carrier active?",
+                "boxes": len(payload.get("Packages", [])),
                 "chunk_num": chunk_num, "total_chunks": total_chunks
             }
     except Exception as e:
@@ -292,6 +294,22 @@ def main():
                         st.error("❌ Missing required columns: name, services")
                         st.stop()
                     
+                    # ✅ DATA QUALITY CHECK - Show warnings before processing
+                    issues = []
+                    if 'city' in df.columns:
+                        empty_cities = df['city'].isna().sum() if 'city' in df.columns else len(df)
+                        if empty_cities > len(df) * 0.5:
+                            issues.append(f"⚠️ {empty_cities}/{len(df)} rows have empty city - may cause rate failures")
+                    
+                    if 'lwh' in df.columns:
+                        lwh_max = df['lwh'].max() if pd.notna(df['lwh']).any() else 0
+                        if lwh_max > 1000:
+                            issues.append(f"⚠️ lwh column has unrealistic values (max: {lwh_max}) - will use length/width/height instead")
+                    
+                    if issues:
+                        st.warning("📋 **Data Quality Issues Found:**\n\n" + "\n\n".join(issues))
+                        st.info("✅ Script will auto-fix these issues during processing")
+                    
                     # Store all orders in session state (parsed once)
                     st.session_state.all_orders = df.to_dict('records')
                     st.session_state.total_orders = len(df)
@@ -329,11 +347,40 @@ def main():
                         try:
                             row = st.session_state.all_orders[idx]
                             
+                            # ✅ FIX: Use length/width/height instead of lwh (lwh has wrong data)
+                            length = safe_float(row.get('length') or row.get('lwh', 10), 10)
+                            width = safe_float(row.get('width') or row.get('lwh', 10), 10)
+                            height = safe_float(row.get('height') or row.get('lwh', 10), 10)
+                            
+                            # ✅ FIX: If lwh values are unrealistic (>1000), use defaults
+                            if length > 1000 or width > 1000 or height > 1000:
+                                length = safe_float(row.get('length', 10), 10)
+                                width = safe_float(row.get('width', 10), 10)
+                                height = safe_float(row.get('height', 10), 10)
+                            
+                            # ✅ FIX: Handle missing city - use "Toronto" as default
+                            city = str(row.get('city', '') or '').strip()
+                            if not city:
+                                city = "Toronto"  # Default city for Canadian addresses
+                            
+                            # ✅ FIX: Handle missing province
+                            province = str(row.get('province', 'ON') or 'ON').strip().upper()
+                            if len(province) > 2:
+                                province = province[:2]  # Truncate to 2 chars
+                            
+                            # ✅ FIX: Handle missing country
+                            country = str(row.get('country', 'CA') or 'CA').strip().upper()
+                            if not country:
+                                country = "CA"
+                            
+                            # ✅ FIX: Handle empty services for RS
+                            service_level = str(row.get('services', '') or '').strip()
+                            
                             order_packages = [{
                                 "Weight": safe_float(row.get('weight', 1), 1.0),
-                                "Length": safe_float(row.get('lwh') or row.get('length', 10), 10),
-                                "Width": safe_float(row.get('lwh') or row.get('width', 10), 10),
-                                "Height": safe_float(row.get('lwh') or row.get('height', 10), 10),
+                                "Length": length,
+                                "Width": width,
+                                "Height": height,
                                 "PackagingWeight": safe_float(row.get('packaging_weight', 0), 0.0),
                                 "SKU": str(row.get('sku', 'N/A')),
                                 "Description": str(row.get('description', 'No description')),
@@ -342,14 +389,14 @@ def main():
                                     "Company": str(row.get('company', '')),
                                     "Address1": str(row.get('address', '')),
                                     "Address2": str(row.get('address2', '')),
-                                    "City": str(row.get('city', '')),
-                                    "StateProvince": str(row.get('province', 'ON')),
-                                    "Postal": str(row.get('postal', '')).replace(" ", "").upper(),
-                                    "Country": str(row.get('country', 'CA')),
+                                    "City": city,  # ✅ Now has default value
+                                    "StateProvince": province,
+                                    "Postal": str(row.get('postal', '')).replace(" ", "").upper()[:10],
+                                    "Country": country,
                                     "Phone": str(row.get('phone', '')),
                                     "Email": str(row.get('email', ''))
                                 },
-                                "ServiceLevel": str(row.get('services', '')).strip(),
+                                "ServiceLevel": service_level,
                                 "Carrier": "RS",
                                 "ClientCode": str(row.get('client_code', fallback_client_code)) or fallback_client_code,
                                 "OrderID": str(row.get('order_id', f'ORD-{idx}'))[:20]
@@ -368,10 +415,21 @@ def main():
                                 "Chunks": "0/0", "Error": str(e)[:100], "DryRun": dry_run
                             })
                     
+                    # Save results
                     st.session_state.all_results.extend(batch_results)
                     st.session_state.processed_indices.extend(batch_indices)
                     
-                    st.success(f"✅ Batch complete! Processed {len(batch_results)} orders. Total: {len(st.session_state.processed_indices)}/{total}")
+                    # ✅ Show detailed error summary if all failed
+                    if len(batch_results) > 0:
+                        failed = sum(1 for r in batch_results if "❌" in r.get("Status", "") or "⚠️" in r.get("Status", ""))
+                        if failed == len(batch_results):
+                            st.error(f"❌ All {len(batch_results)} orders failed. Check errors below:")
+                            for r in batch_results[:3]:
+                                if r.get("Error"):
+                                    st.write(f"- {r.get('OrderID')}: {r.get('Error')}")
+                            st.info("💡 **Common fixes:** Check postal codes are valid, city/province filled, client code active")
+                        else:
+                            st.success(f"✅ Batch complete! Processed {len(batch_results)} orders. Total: {len(st.session_state.processed_indices)}/{total}")
                     
                     if len(st.session_state.processed_indices) >= total:
                         st.session_state.processing_complete = True
