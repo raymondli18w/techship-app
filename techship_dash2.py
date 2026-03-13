@@ -53,7 +53,6 @@ for carrier, info in CARRIER_SERVICE_MAP.items():
 # Helper Functions
 # =========================
 def create_robust_session():
-    """Create session with extended timeouts and connection pooling"""
     session = requests.Session()
     retry_strategy = Retry(
         total=3,
@@ -104,7 +103,6 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
         clean_columns.append(cleaned)
     df.columns = clean_columns
 
-    # ✅ Drop any empty column names (caused by trailing commas in CSV)
     df = df.loc[:, df.columns != '']
 
     column_mapping = {
@@ -240,13 +238,6 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
         packaging_weight = safe_float('packaging_weight', 0.0)
         num_boxes = safe_int('boxes', 1)
         
-        # ✅ WARNING: Large box counts will take longer but will NOT be split
-        if num_boxes > 100:
-            estimated_time = num_boxes * 0.5  # ~0.5 sec per box
-            st.warning(f"⏳ Row {int(idx) + 2}: **{num_boxes} boxes** detected. Estimated processing time: ~{estimated_time:.0f} seconds. This is normal — please wait.")
-        if num_boxes > 1000:
-            st.warning(f"⚠️ Row {int(idx) + 2}: **{num_boxes} boxes** is a very large shipment. Processing may take several minutes.")
-        
         row_client_code = safe_string('client_code') or fallback_client_code
 
         postal_prefix = safe_string('postal_prefix')
@@ -330,7 +321,8 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
         if not weight_values:
             weight_values = {"weight": 1.0}
 
-        # ✅ Create INDIVIDUAL package object for EACH box (no splitting)
+        # ✅ HYBRID CHUNKING: Create individual package objects for ALL boxes
+        # Large orders will be chunked into multiple API calls later
         for dim in dimension_sets:
             for weight_col, weight_val in weight_values.items():
                 for box_num in range(num_boxes):
@@ -366,58 +358,36 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
     
     st.info(f"ℹ️ Created {len(packages)} individual package objects from {len(df)} CSV rows")
     for order_id, count in sorted(order_counts.items()):
-        st.write(f"📦 {order_id}: {count} box(es)")
+        chunk_info = f"({count // 50} API calls)" if count > 50 else ""
+        st.write(f"📦 {order_id}: {count} box(es) {chunk_info}")
     
     return packages, carrier
 
-# ✅ UPDATED: Extended timeout with retry logic for large orders
-def submit_single_shipment(payload, client_code, order_id, batch_id, dry_run=True, num_boxes=1):
+# ✅ Submit single chunk (max 50 packages per API call)
+def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_num=1, total_chunks=1):
     session = create_robust_session()
-    original_payload = payload.copy()
-    
-    # ✅ Dynamic timeout based on package count (NO upper limit)
-    if num_boxes <= 50:
-        timeout = 60
-    elif num_boxes <= 100:
-        timeout = 120
-    elif num_boxes <= 500:
-        timeout = 300  # 5 minutes
-    elif num_boxes <= 1000:
-        timeout = 600  # 10 minutes
-    else:
-        timeout = 900  # 15 minutes for 2000+ boxes
+    timeout = 120  # 2 minutes per chunk
     
     try:
         payload["ClientCode"] = client_code
         params = {"dryRun": "true" if dry_run else "false"}
-        
-        # Show timeout info for large orders
-        if num_boxes > 100:
-            st.info(f"⏳ Processing {num_boxes} boxes... Timeout set to {timeout}s. Please wait.")
         
         response = session.post(API_URL, headers=HEADERS, json=payload, params=params, timeout=timeout)
 
         if response.status_code != 200:
             error_text = response.text[:200] if response.text else "No details"
             return {
-                "Status": f"❌ HTTP {response.status_code}",
-                "OrderID": order_id,
-                "TransactionNumber": payload.get("TransactionNumber", "N/A"),
-                "TrackingNumber": "N/A",
-                "Cost": "$0.00",
-                "BaseAmount": "$0.00",
-                "FuelSurcharge": "$0.00",
-                "Service": payload.get("Routing", {}).get("ServiceCode", "N/A"),
-                "Carrier": payload.get("CarrierCode", "N/A"),
-                "Recipient": payload.get("ShipToAddress", {}).get("Name", "N/A"),
-                "PostalCode": payload.get("ShipToAddress", {}).get("Postal", "N/A"),
-                "Boxes": num_boxes,
-                "ExpectedDelivery": "N/A",
-                "Zone": "N/A",
-                "Error": f"HTTP {response.status_code}: {error_text}",
-                "ClientCode": client_code,
-                "BatchID": batch_id,
-                "DryRun": dry_run
+                "success": False,
+                "cost": 0,
+                "base_amount": 0,
+                "fuel_surcharge": 0,
+                "public_total": 0,
+                "service": "N/A",
+                "carrier": payload.get("CarrierCode", "N/A"),
+                "error": f"HTTP {response.status_code}: {error_text}",
+                "boxes": len(payload.get("Packages", [])),
+                "chunk_num": chunk_num,
+                "total_chunks": total_chunks
             }
 
         try:
@@ -426,193 +396,213 @@ def submit_single_shipment(payload, client_code, order_id, batch_id, dry_run=Tru
                 response_data = {}
         except Exception:
             return {
-                "Status": "❌ Invalid JSON",
-                "Error": "Response was not valid JSON",
-                "OrderID": order_id,
-                "TransactionNumber": payload.get("TransactionNumber", "N/A"),
-                "TrackingNumber": "N/A",
-                "Cost": "$0.00",
-                "BaseAmount": "$0.00",
-                "FuelSurcharge": "$0.00",
-                "Service": payload.get("Routing", {}).get("ServiceCode", "N/A"),
-                "Carrier": payload.get("CarrierCode", "N/A"),
-                "Recipient": payload.get("ShipToAddress", {}).get("Name", "N/A"),
-                "PostalCode": payload.get("ShipToAddress", {}).get("Postal", "N/A"),
-                "Boxes": num_boxes,
-                "ExpectedDelivery": "N/A",
-                "Zone": "N/A",
-                "ClientCode": client_code,
-                "BatchID": batch_id,
-                "DryRun": dry_run
+                "success": False,
+                "cost": 0,
+                "base_amount": 0,
+                "fuel_surcharge": 0,
+                "public_total": 0,
+                "service": "N/A",
+                "carrier": payload.get("CarrierCode", "N/A"),
+                "error": "Invalid JSON response",
+                "boxes": len(payload.get("Packages", [])),
+                "chunk_num": chunk_num,
+                "total_chunks": total_chunks
             }
 
         rates = response_data.get("Rates")
         if rates and isinstance(rates, list) and len(rates) > 0:
             best_rate = next((r for r in rates if r.get("IsBest")), rates[0])
-            total_cost = best_rate.get("TotalAmount", best_rate.get("Amount", 0))
-            service_code = best_rate.get("ServiceCode", payload.get("Routing", {}).get("ServiceCode", "N/A"))
-            service_name = best_rate.get("ServiceName", service_code)
-            expected_delivery = best_rate.get("ExpectedDeliveryDate", "N/A")
-            zone = best_rate.get("Zone", "N/A")
-            fuel_surcharge = best_rate.get("FuelSurcharge", 0)
-            base_amount = best_rate.get("BaseAmount", 0)
-            public_total = best_rate.get("PublicTotalAmount", total_cost)
+            return {
+                "success": True,
+                "cost": best_rate.get("TotalAmount", best_rate.get("Amount", 0)),
+                "base_amount": best_rate.get("BaseAmount", 0),
+                "fuel_surcharge": best_rate.get("FuelSurcharge", 0),
+                "public_total": best_rate.get("PublicTotalAmount", 0),
+                "service": best_rate.get("ServiceName", best_rate.get("ServiceCode", "N/A")),
+                "carrier": payload.get("CarrierCode", "N/A"),
+                "error": None,
+                "boxes": len(payload.get("Packages", [])),
+                "chunk_num": chunk_num,
+                "total_chunks": total_chunks
+            }
         else:
-            total_cost = 0
-            service_code = payload.get("Routing", {}).get("ServiceCode", "N/A")
-            service_name = service_code
-            expected_delivery = "N/A"
-            zone = "N/A"
-            fuel_surcharge = 0
-            base_amount = 0
-            public_total = 0
-
-        status_text = "✅ Estimate (DryRun)" if dry_run else "✅ Saved to DB"
-
-        return {
-            "Status": status_text,
-            "OrderID": order_id,
-            "TransactionNumber": payload.get("TransactionNumber", "N/A"),
-            "TrackingNumber": "N/A (Estimate Only)",
-            "Cost": f"${total_cost:.2f}",
-            "BaseAmount": f"${base_amount:.2f}",
-            "FuelSurcharge": f"${fuel_surcharge:.2f}",
-            "PublicTotal": f"${public_total:.2f}",
-            "Service": f"{service_name} ({service_code})",
-            "Carrier": payload.get("CarrierCode", "N/A"),
-            "Recipient": payload["ShipToAddress"]["Name"],
-            "PostalCode": payload["ShipToAddress"]["Postal"],
-            "Boxes": num_boxes,
-            "ExpectedDelivery": expected_delivery,
-            "Zone": zone,
-            "ClientCode": client_code,
-            "BatchID": batch_id,
-            "DryRun": dry_run
-        }
+            return {
+                "success": False,
+                "cost": 0,
+                "base_amount": 0,
+                "fuel_surcharge": 0,
+                "public_total": 0,
+                "service": "N/A",
+                "carrier": payload.get("CarrierCode", "N/A"),
+                "error": "No rates returned",
+                "boxes": len(payload.get("Packages", [])),
+                "chunk_num": chunk_num,
+                "total_chunks": total_chunks
+            }
 
     except requests.exceptions.Timeout:
         return {
-            "Status": "❌ Timeout",
-            "OrderID": order_id,
-            "TransactionNumber": payload.get("TransactionNumber", "unknown"),
-            "TrackingNumber": "N/A",
-            "Cost": "$0.00",
-            "BaseAmount": "$0.00",
-            "FuelSurcharge": "$0.00",
-            "PublicTotal": "$0.00",
-            "Service": payload.get("Routing", {}).get("ServiceCode", "unknown"),
-            "Carrier": payload.get("CarrierCode", "unknown"),
-            "Recipient": payload.get("ShipToAddress", {}).get("Name", "unknown"),
-            "PostalCode": payload.get("ShipToAddress", {}).get("Postal", "unknown"),
-            "Boxes": num_boxes,
-            "ExpectedDelivery": "N/A",
-            "Zone": "N/A",
-            "Error": f"Request timed out after {timeout}s. The API took too long. Try again or contact support.",
-            "ClientCode": client_code,
-            "BatchID": batch_id,
-            "DryRun": dry_run
+            "success": False,
+            "cost": 0,
+            "base_amount": 0,
+            "fuel_surcharge": 0,
+            "public_total": 0,
+            "service": "N/A",
+            "carrier": payload.get("CarrierCode", "N/A"),
+            "error": f"Timeout after {timeout}s",
+            "boxes": len(payload.get("Packages", [])),
+            "chunk_num": chunk_num,
+            "total_chunks": total_chunks
         }
     except Exception as e:
         return {
-            "Status": "❌ Failed",
-            "OrderID": order_id,
-            "TransactionNumber": payload.get("TransactionNumber", "unknown"),
-            "TrackingNumber": "N/A",
-            "Cost": "$0.00",
-            "BaseAmount": "$0.00",
-            "FuelSurcharge": "$0.00",
-            "PublicTotal": "$0.00",
-            "Service": payload.get("Routing", {}).get("ServiceCode", "unknown"),
-            "Carrier": payload.get("CarrierCode", "unknown"),
-            "Recipient": payload.get("ShipToAddress", {}).get("Name", "unknown"),
-            "PostalCode": payload.get("ShipToAddress", {}).get("Postal", "unknown"),
-            "Boxes": num_boxes,
-            "ExpectedDelivery": "N/A",
-            "Zone": "N/A",
-            "Error": str(e)[:150],
-            "ClientCode": client_code,
-            "BatchID": batch_id,
-            "DryRun": dry_run
+            "success": False,
+            "cost": 0,
+            "base_amount": 0,
+            "fuel_surcharge": 0,
+            "public_total": 0,
+            "service": "N/A",
+            "carrier": payload.get("CarrierCode", "N/A"),
+            "error": str(e)[:150],
+            "boxes": len(payload.get("Packages", [])),
+            "chunk_num": chunk_num,
+            "total_chunks": total_chunks
         }
     finally:
         session.close()
 
-def submit_all_shipments(packages, carrier, fallback_client_code, batch_id, dry_run=True, max_workers=4):
-    """Submit packages grouped by OrderID - each order gets ALL its boxes in one API call"""
-    actual_workers = min(max_workers, 4)  # Limit workers for large orders
+# ✅ HYBRID: Chunk large orders, submit each chunk, sum results
+def submit_all_shipments(packages, carrier, fallback_client_code, batch_id, dry_run=True, max_workers=2, chunk_size=50):
+    """Submit packages in chunks for large orders, sum up costs"""
+    actual_workers = min(max_workers, 4)
     
     # Group packages by OrderID
     orders = defaultdict(list)
     for pkg in packages:
         orders[pkg["OrderID"]].append(pkg)
     
-    payloads = []
+    all_results = []
+    
     for order_id, order_packages in orders.items():
-        customer_order = order_id[:20]
+        total_boxes = len(order_packages)
+        num_chunks = (total_boxes + chunk_size - 1) // chunk_size  # Ceiling division
+        
+        # Show progress for this order
+        if num_chunks > 1:
+            st.info(f"⏳ {order_id}: Processing {total_boxes} boxes in {num_chunks} chunks...")
+        
+        # Split into chunks
+        chunks = []
+        for i in range(0, total_boxes, chunk_size):
+            chunk_packages = order_packages[i:i + chunk_size]
+            chunks.append(chunk_packages)
+        
+        # Submit each chunk
+        chunk_results = []
         transaction_number = str(uuid.uuid4()).replace("-", "")[:20]
+        customer_order = order_id[:20]
         
-        # Build Packages array with ALL individual boxes for this order
-        packages_array = []
-        for pkg in order_packages:
-            packages_array.append({
-                "Weight": pkg["Weight"],
-                "Dimensions": {
-                    "Length": pkg["Length"],
-                    "Width": pkg["Width"],
-                    "Height": pkg["Height"],
-                    "PackagingWeight": pkg["PackagingWeight"]
-                },
-                "Items": [{
-                    "SKU": pkg["SKU"],
-                    "Description": pkg["Description"],
-                    "Quantity": 1
-                }]
-            })
-        
-        payload = {
-            "TransactionNumber": transaction_number,
-            "CustomerOrder": customer_order,
-            "BatchNumber": batch_id,
-            "CarrierCode": CARRIER_SERVICE_MAP[carrier]["CarrierCode"],
-            "Routing": {
-                "CarrierCode": CARRIER_SERVICE_MAP[carrier]["CarrierCode"],
-                "ServiceCode": order_packages[0]["ServiceLevel"],
-                "FreightPaymentTerms": "Prepaid"
-            },
-            "ShipToAddress": order_packages[0]["Address"],
-            "Packages": packages_array
-        }
-        
-        client_code_val = order_packages[0].get("ClientCode") or fallback_client_code
-        num_boxes = len(order_packages)
-        
-        payloads.append((payload, client_code_val, customer_order, batch_id, num_boxes))
-    
-    results = []
-    total_orders = len(payloads)
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=actual_workers) as executor:
-        futures = [executor.submit(submit_single_shipment, payload, client_code_val, order_id, bid, dry_run, num_boxes) 
-                   for payload, client_code_val, order_id, bid, num_boxes in payloads]
-        
-        # Show progress with order count
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        
-        for i, future in enumerate(concurrent.futures.as_completed(futures)):
-            results.append(future.result())
-            progress = (i + 1) / total_orders
-            progress_bar.progress(progress)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=actual_workers) as executor:
+            futures = []
+            for chunk_num, chunk_packages in enumerate(chunks, 1):
+                # Build payload for this chunk
+                packages_array = []
+                for pkg in chunk_packages:
+                    packages_array.append({
+                        "Weight": pkg["Weight"],
+                        "Dimensions": {
+                            "Length": pkg["Length"],
+                            "Width": pkg["Width"],
+                            "Height": pkg["Height"],
+                            "PackagingWeight": pkg["PackagingWeight"]
+                        },
+                        "Items": [{
+                            "SKU": pkg["SKU"],
+                            "Description": pkg["Description"],
+                            "Quantity": 1
+                        }]
+                    })
+                
+                payload = {
+                    "TransactionNumber": f"{transaction_number}-{chunk_num:03d}",
+                    "CustomerOrder": customer_order,
+                    "BatchNumber": batch_id,
+                    "CarrierCode": CARRIER_SERVICE_MAP[carrier]["CarrierCode"],
+                    "Routing": {
+                        "CarrierCode": CARRIER_SERVICE_MAP[carrier]["CarrierCode"],
+                        "ServiceCode": chunk_packages[0]["ServiceLevel"],
+                        "FreightPaymentTerms": "Prepaid"
+                    },
+                    "ShipToAddress": chunk_packages[0]["Address"],
+                    "Packages": packages_array
+                }
+                
+                client_code_val = chunk_packages[0].get("ClientCode") or fallback_client_code
+                
+                future = executor.submit(submit_chunk, payload, client_code_val, order_id, batch_id, dry_run, chunk_num, num_chunks)
+                futures.append(future)
             
-            # Show which order is processing
-            completed_orders = [r.get("OrderID", "?") for r in results]
-            status_text.text(f"⏳ Processing: {i + 1}/{total_orders} orders completed")
+            # Collect chunk results
+            for future in concurrent.futures.as_completed(futures):
+                chunk_results.append(future.result())
         
-        progress_bar.empty()
-        status_text.empty()
+        # ✅ Sum up all chunk results for this order
+        total_cost = sum(r["cost"] for r in chunk_results)
+        total_base = sum(r["base_amount"] for r in chunk_results)
+        total_fuel = sum(r["fuel_surcharge"] for r in chunk_results)
+        total_public = sum(r["public_total"] for r in chunk_results)
+        successful_chunks = sum(1 for r in chunk_results if r["success"])
+        failed_chunks = num_chunks - successful_chunks
+        
+        # Get service info from first successful chunk
+        service_info = "N/A"
+        carrier_info = carrier
+        error_info = None
+        for r in chunk_results:
+            if r["success"]:
+                service_info = r["service"]
+                carrier_info = r["carrier"]
+                break
+        
+        if failed_chunks > 0:
+            error_info = f"{failed_chunks}/{num_chunks} chunks failed"
+            for r in chunk_results:
+                if r["error"]:
+                    error_info = f"{error_info} | Chunk {r['chunk_num']}: {r['error']}"
+                    break
+        
+        status_text = "✅ Estimate (DryRun)" if dry_run else "✅ Saved to DB"
+        if failed_chunks > 0:
+            status_text = f"⚠️ Partial ({successful_chunks}/{num_chunks} chunks)"
+        if failed_chunks == num_chunks:
+            status_text = "❌ Failed"
+        
+        all_results.append({
+            "Status": status_text,
+            "OrderID": order_id,
+            "TransactionNumber": transaction_number,
+            "BatchID": batch_id,
+            "Boxes": total_boxes,
+            "Cost": f"${total_cost:.2f}",
+            "BaseAmount": f"${total_base:.2f}",
+            "FuelSurcharge": f"${total_fuel:.2f}",
+            "PublicTotal": f"${total_public:.2f}",
+            "Service": service_info,
+            "Carrier": carrier_info,
+            "Recipient": order_packages[0]["Address"]["Name"],
+            "PostalCode": order_packages[0]["Address"]["Postal"],
+            "ExpectedDelivery": "N/A",
+            "Zone": "N/A",
+            "Chunks": f"{successful_chunks}/{num_chunks}",
+            "Error": error_info,
+            "DryRun": dry_run
+        })
+        
+        if num_chunks > 1:
+            st.success(f"✅ {order_id}: {total_boxes} boxes processed in {num_chunks} chunks. Total: ${total_cost:.2f}")
     
-    results.sort(key=lambda x: x.get("OrderID", ""))
-    return results
+    all_results.sort(key=lambda x: x.get("OrderID", ""))
+    return all_results
 
 def add_selectable_css():
     st.markdown("""
@@ -629,7 +619,7 @@ def add_selectable_css():
 def main():
     add_selectable_css()
     st.title("📦 TechSHIP Bulk Rate Estimator")
-    st.markdown("### Extended Timeout Mode — Large Orders Supported (2000+ Boxes)")
+    st.markdown("### Hybrid Chunking Mode — Large Orders Split Automatically")
 
     fallback_client_code = st.text_input("Fallback Client Code", value="omrtest1")
     if not fallback_client_code.strip():
@@ -656,19 +646,22 @@ def main():
         - Leave `services` blank → RateShopping (RS)
         **Dimensions**: `lwh` or `length/width/height`  
         **Weights**: `weight`, `weight2`, ...
-        **✅ Large Orders**: 2000+ boxes supported with extended timeouts
+        **✅ Hybrid Chunking**: Orders >50 boxes auto-split into 50-box chunks
         """)
         
-        st.info("⏳ **Timeout Settings:**")
+        st.info("⏳ **Chunking Settings:**")
         st.markdown("""
-        | Boxes | Timeout |
-        |-------|---------|
-        | 1-50 | 60s |
-        | 51-100 | 120s |
-        | 101-500 | 300s (5 min) |
-        | 501-1000 | 600s (10 min) |
-        | 1000+ | 900s (15 min) |
+        | Boxes | API Calls | Est. Time |
+        |-------|-----------|-----------|
+        | 1-50 | 1 call | ~30s |
+        | 51-100 | 2 calls | ~60s |
+        | 101-500 | 3-10 calls | ~5 min |
+        | 501-2000 | 11-40 calls | ~15 min |
         """)
+        
+        chunk_size = st.slider("Chunk Size (boxes per API call)", 25, 100, 50, 
+                               help="Smaller = more stable, Larger = fewer API calls")
+        st.session_state.chunk_size = chunk_size
         
         if dry_run:
             st.warning("⚠️ **Dry Run Mode ON** — Estimates NOT saved to database.")
@@ -695,6 +688,8 @@ def main():
         st.session_state.processing_done = False
         st.session_state.all_results = []
         
+        chunk_size = st.session_state.get("chunk_size", 50)
+        
         with st.spinner("🔍 Parsing data..."):
             df = parse_input_data(text_input, uploaded_file)
             if df is None: 
@@ -710,7 +705,9 @@ def main():
             st.success(f"✅ Parsed {st.session_state.total_orders} unique orders ({total_boxes} total packages)")
             
             if total_boxes > 500:
-                st.warning(f"⏳ **Large Shipment:** {total_boxes} boxes detected. Processing may take 5-15 minutes. Please do not close this window.")
+                estimated_calls = (total_boxes + chunk_size - 1) // chunk_size
+                estimated_time = estimated_calls * 30  # ~30s per API call
+                st.warning(f"⏳ **Large Shipment:** {total_boxes} boxes = ~{estimated_calls} API calls. Estimated time: ~{estimated_time // 60} minutes. Please do not close this window.")
 
         st.subheader("⚙️ Configuration")
         max_workers = st.slider("Parallel Workers", 1, 4, 2, help="Lower workers = more stable for large orders")
@@ -718,12 +715,13 @@ def main():
         batch_id = str(uuid.uuid4()).replace("-", "")[:20]
         st.session_state.batch_id = batch_id
 
-        with st.spinner(f"📤 Getting estimates for {total_boxes} packages..."):
+        with st.spinner(f"📤 Getting estimates for {total_boxes} packages (chunk size: {chunk_size})..."):
             all_results = submit_all_shipments(
                 packages, carrier, fallback_client_code.strip(),
                 batch_id=batch_id,
                 dry_run=dry_run,
-                max_workers=max_workers
+                max_workers=max_workers,
+                chunk_size=chunk_size
             )
             st.session_state.all_results = all_results
             st.session_state.processing_done = True
@@ -750,6 +748,7 @@ def main():
                 "BatchID": r.get("BatchID", "N/A"),
                 "TransactionNumber": r.get("TransactionNumber", "N/A"),
                 "Boxes": r.get("Boxes", 0),
+                "Chunks": r.get("Chunks", "1/1"),
                 "Cost": r.get("Cost", "$0.00"),
                 "BaseAmount": r.get("BaseAmount", ""),
                 "FuelSurcharge": r.get("FuelSurcharge", ""),
@@ -761,15 +760,15 @@ def main():
                 "ExpectedDelivery": r.get("ExpectedDelivery", "N/A"),
                 "Zone": r.get("Zone", "N/A")
             }
-            if "Error" in r:
+            if r.get("Error"):
                 row["Error"] = r["Error"]
             display_data.append(row)
         
         results_df = pd.DataFrame(display_data)
         display_cols = [
             "OrderID", "Status", "BatchID", "TransactionNumber",
-            "Boxes", "Cost", "BaseAmount", "FuelSurcharge", "PublicTotal", 
-            "Service", "Carrier", "Recipient", "PostalCode", "ExpectedDelivery", "Zone"
+            "Boxes", "Chunks", "Cost", "BaseAmount", "FuelSurcharge", "PublicTotal", 
+            "Service", "Carrier", "Recipient", "PostalCode"
         ]
         if "Error" in results_df.columns:
             display_cols.append("Error")
