@@ -4,9 +4,10 @@ import requests
 import uuid
 import concurrent.futures
 import time
+import math
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from io import BytesIO
+from io import BytesIO, StringIO
 from collections import defaultdict
 
 # SQLite Address Lookup
@@ -51,6 +52,18 @@ for carrier, info in CARRIER_SERVICE_MAP.items():
 # =========================
 # Helper Functions
 # =========================
+def safe_float(value, default=0.0):
+    """Safely convert value to float, handling NaN/None/invalid values"""
+    if value is None:
+        return default
+    try:
+        f = float(value)
+        if math.isnan(f) or math.isinf(f):
+            return default
+        return f
+    except (ValueError, TypeError):
+        return default
+
 def create_robust_session():
     session = requests.Session()
     retry_strategy = Retry(total=3, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
@@ -70,32 +83,51 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
 
         if response.status_code != 200:
             error_text = response.text[:200] if response.text else "No details"
-            return {"success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0, 
-                    "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
-                    "error": f"HTTP {response.status_code}: {error_text}", "boxes": len(payload.get("Packages", [])),
-                    "chunk_num": chunk_num, "total_chunks": total_chunks}
+            return {
+                "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
+                "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
+                "error": f"HTTP {response.status_code}: {error_text}", "boxes": len(payload.get("Packages", [])),
+                "chunk_num": chunk_num, "total_chunks": total_chunks
+            }
 
-        response_data = response.json()
+        try:
+            response_data = response.json()
+            if not isinstance(response_data, dict):
+                response_data = {}
+        except Exception:
+            return {
+                "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
+                "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
+                "error": "Invalid JSON response", "boxes": len(payload.get("Packages", [])),
+                "chunk_num": chunk_num, "total_chunks": total_chunks
+            }
+
         rates = response_data.get("Rates", [])
         if rates and len(rates) > 0:
             best_rate = next((r for r in rates if r.get("IsBest")), rates[0])
-            return {"success": True, 
-                    "cost": float(best_rate.get("TotalAmount", best_rate.get("Amount", 0)) or 0),
-                    "base_amount": float(best_rate.get("BaseAmount", 0) or 0),
-                    "fuel_surcharge": float(best_rate.get("FuelSurcharge", 0) or 0),
-                    "public_total": float(best_rate.get("PublicTotalAmount", 0) or 0),
-                    "service": best_rate.get("ServiceName", best_rate.get("ServiceCode", "N/A")),
-                    "carrier": payload.get("CarrierCode", "N/A"), "error": None,
-                    "boxes": len(payload.get("Packages", [])), "chunk_num": chunk_num, "total_chunks": total_chunks}
+            return {
+                "success": True,
+                "cost": safe_float(best_rate.get("TotalAmount", best_rate.get("Amount", 0))),
+                "base_amount": safe_float(best_rate.get("BaseAmount", 0)),
+                "fuel_surcharge": safe_float(best_rate.get("FuelSurcharge", 0)),
+                "public_total": safe_float(best_rate.get("PublicTotalAmount", 0)),
+                "service": best_rate.get("ServiceName", best_rate.get("ServiceCode", "N/A")),
+                "carrier": payload.get("CarrierCode", "N/A"), "error": None,
+                "boxes": len(payload.get("Packages", [])), "chunk_num": chunk_num, "total_chunks": total_chunks
+            }
         else:
-            return {"success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0, 
-                    "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
-                    "error": "No rates returned", "boxes": len(payload.get("Packages", [])),
-                    "chunk_num": chunk_num, "total_chunks": total_chunks}
+            return {
+                "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
+                "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
+                "error": "No rates returned", "boxes": len(payload.get("Packages", [])),
+                "chunk_num": chunk_num, "total_chunks": total_chunks
+            }
     except Exception as e:
-        return {"success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0, 
-                "public_total": 0.0, "service": "N/A", "carrier": "N/A", "error": str(e)[:150],
-                "boxes": 0, "chunk_num": chunk_num, "total_chunks": total_chunks}
+        return {
+            "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
+            "public_total": 0.0, "service": "N/A", "carrier": "N/A", "error": str(e)[:150],
+            "boxes": 0, "chunk_num": chunk_num, "total_chunks": total_chunks
+        }
     finally:
         session.close()
 
@@ -134,12 +166,16 @@ def process_order_batch(order_packages, carrier, fallback_client_code, batch_id,
         
         for future in concurrent.futures.as_completed(futures):
             result = future.result()
-            chunk_results.append(result if result and isinstance(result, dict) else {"success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0, "public_total": 0.0, "service": "N/A", "carrier": carrier, "error": "No result", "boxes": 0, "chunk_num": len(chunk_results) + 1, "total_chunks": num_chunks})
+            chunk_results.append(result if result and isinstance(result, dict) else {
+                "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0, "public_total": 0.0,
+                "service": "N/A", "carrier": carrier, "error": "No result", "boxes": 0,
+                "chunk_num": len(chunk_results) + 1, "total_chunks": num_chunks
+            })
     
-    total_cost = sum(r.get("cost", 0) for r in chunk_results if r.get("success"))
-    total_base = sum(r.get("base_amount", 0) for r in chunk_results if r.get("success"))
-    total_fuel = sum(r.get("fuel_surcharge", 0) for r in chunk_results if r.get("success"))
-    total_public = sum(r.get("public_total", 0) for r in chunk_results if r.get("success"))
+    total_cost = sum(safe_float(r.get("cost", 0)) for r in chunk_results if r.get("success"))
+    total_base = sum(safe_float(r.get("base_amount", 0)) for r in chunk_results if r.get("success"))
+    total_fuel = sum(safe_float(r.get("fuel_surcharge", 0)) for r in chunk_results if r.get("success"))
+    total_public = sum(safe_float(r.get("public_total", 0)) for r in chunk_results if r.get("success"))
     successful_chunks = sum(1 for r in chunk_results if r.get("success"))
     
     service_info = next((r.get("service", "N/A") for r in chunk_results if r.get("success")), "N/A")
@@ -178,7 +214,7 @@ def main():
     st.title("📦 TechSHIP Bulk Rate Estimator")
     st.markdown("### ⚡ Incremental Batch Processing — See Results Immediately")
 
-    fallback_client_code = st.text_input("Fallback Client Code", value="omrtest1")
+    fallback_client_code = st.text_input("Fallback Client Code", value="8470HWY50")
     if not fallback_client_code.strip():
         st.warning("⚠️ Please enter a valid Fallback Client Code")
         st.stop()
@@ -206,7 +242,7 @@ def main():
         st.markdown("---")
         st.code("https://18wheels.techship.ca/")
 
-    # ✅ INITIALIZE SESSION STATE
+    # INITIALIZE SESSION STATE
     if "file_uploaded" not in st.session_state:
         st.session_state.file_uploaded = False
     if "all_orders" not in st.session_state:
@@ -224,7 +260,7 @@ def main():
     if "processing_complete" not in st.session_state:
         st.session_state.processing_complete = False
 
-    # ✅ FILE UPLOAD (Only Once)
+    # FILE UPLOAD (Only Once)
     if not st.session_state.file_uploaded:
         col1, col2 = st.columns(2)
         with col1:
@@ -261,7 +297,7 @@ def main():
                     st.session_state.total_orders = len(df)
                     st.session_state.file_uploaded = True
                     st.session_state.batch_id = str(uuid.uuid4()).replace("-", "")[:20]
-                    st.session_state.carrier = "RS"  # Default
+                    st.session_state.carrier = "RS"
                     
                     st.success(f"✅ Loaded {st.session_state.total_orders} orders! Ready to process.")
                     st.rerun()
@@ -269,7 +305,7 @@ def main():
                 except Exception as e:
                     st.error(f"❌ Parse error: {str(e)}")
     else:
-        # ✅ FILE ALREADY LOADED - Show Progress & Continue Button
+        # FILE ALREADY LOADED - Show Progress & Continue Button
         processed = len(st.session_state.processed_indices)
         total = st.session_state.total_orders
         remaining = total - processed
@@ -283,7 +319,6 @@ def main():
         with col1:
             continue_disabled = remaining <= 0 or st.session_state.processing_complete
             if st.button("▶️ Process Next Batch", type="primary", disabled=continue_disabled, use_container_width=True):
-                # Process next batch
                 batch_start = processed
                 batch_end = min(batch_start + batch_size, total)
                 batch_indices = list(range(batch_start, batch_end))
@@ -294,13 +329,12 @@ def main():
                         try:
                             row = st.session_state.all_orders[idx]
                             
-                            # Simple order processing (1 box per order for speed)
                             order_packages = [{
-                                "Weight": float(row.get('weight', 1)) or 1.0,
-                                "Length": float(row.get('lwh') or row.get('length', 10)) or 10,
-                                "Width": float(row.get('lwh') or row.get('width', 10)) or 10,
-                                "Height": float(row.get('lwh') or row.get('height', 10)) or 10,
-                                "PackagingWeight": float(row.get('packaging_weight', 0)) or 0.0,
+                                "Weight": safe_float(row.get('weight', 1), 1.0),
+                                "Length": safe_float(row.get('lwh') or row.get('length', 10), 10),
+                                "Width": safe_float(row.get('lwh') or row.get('width', 10), 10),
+                                "Height": safe_float(row.get('lwh') or row.get('height', 10), 10),
+                                "PackagingWeight": safe_float(row.get('packaging_weight', 0), 0.0),
                                 "SKU": str(row.get('sku', 'N/A')),
                                 "Description": str(row.get('description', 'No description')),
                                 "Address": {
@@ -321,7 +355,7 @@ def main():
                                 "OrderID": str(row.get('order_id', f'ORD-{idx}'))[:20]
                             }]
                             
-                            result = process_order_batch(order_packages, "RS", fallback_client_code.strip(), 
+                            result = process_order_batch(order_packages, "RS", fallback_client_code.strip(),
                                                         st.session_state.batch_id, dry_run, chunk_size)
                             batch_results.append(result)
                             
@@ -334,7 +368,6 @@ def main():
                                 "Chunks": "0/0", "Error": str(e)[:100], "DryRun": dry_run
                             })
                     
-                    # Save results
                     st.session_state.all_results.extend(batch_results)
                     st.session_state.processed_indices.extend(batch_indices)
                     
@@ -361,7 +394,7 @@ def main():
                     st.session_state[key] = [] if key in ["all_orders", "processed_indices", "all_results"] else "" if key == "batch_id" or key == "carrier" else False if key == "file_uploaded" or key == "processing_complete" else 0 if key == "total_orders" else None
                 st.rerun()
         
-        # ✅ DISPLAY RESULTS (Always Visible)
+        # DISPLAY RESULTS (Always Visible)
         if st.session_state.all_results:
             st.subheader(f"📊 Results So Far ({len(st.session_state.all_results)} orders)")
             
@@ -377,12 +410,12 @@ def main():
             success = sum(1 for r in st.session_state.all_results if "✅" in r.get("Status", ""))
             col1.metric("Successful", success)
             col2.metric("Failed", len(st.session_state.all_results) - success)
-            col3.metric("Total Cost", f"${sum(float(r.get('Cost', '$0').replace('$', '')) for r in st.session_state.all_results):.2f}")
+            col3.metric("Total Cost", f"${sum(safe_float(r.get('Cost', '$0').replace('$', '')) for r in st.session_state.all_results):.2f}")
         
-        # ✅ SHOW REMAINING INFO
+        # SHOW REMAINING INFO
         if remaining > 0:
             st.info(f"⏭️ {remaining} orders remaining. Click **Process Next Batch** to continue.")
-            est_time = (remaining / batch_size) * 1  # ~1 min per batch
+            est_time = (remaining / batch_size) * 1
             st.write(f"⏱️ Estimated time remaining: ~{est_time:.0f} minutes")
         else:
             st.success("🎉 All orders processed!")
