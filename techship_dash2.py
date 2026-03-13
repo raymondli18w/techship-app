@@ -103,7 +103,6 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
         clean_columns.append(cleaned)
     df.columns = clean_columns
 
-    # ✅ Drop any empty column names (caused by trailing commas in CSV)
     df = df.loc[:, df.columns != '']
 
     column_mapping = {
@@ -322,7 +321,6 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
         if not weight_values:
             weight_values = {"weight": 1.0}
 
-        # ✅ Create INDIVIDUAL package object for EACH box (will be chunked later)
         for dim in dimension_sets:
             for weight_col, weight_val in weight_values.items():
                 for box_num in range(num_boxes):
@@ -351,7 +349,6 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
         st.error("❌ No valid packages created.")
         return None
     
-    # Show package summary
     order_counts = defaultdict(int)
     for pkg in packages:
         order_counts[pkg["OrderID"]] += 1
@@ -363,10 +360,9 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
     
     return packages, carrier
 
-# ✅ Submit single chunk (max 50 packages per API call)
 def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_num=1, total_chunks=1):
     session = create_robust_session()
-    timeout = 120  # 2 minutes per chunk
+    timeout = 120
     
     try:
         payload["ClientCode"] = client_code
@@ -376,7 +372,6 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
 
         if response.status_code != 200:
             error_text = response.text[:200] if response.text else "No details"
-            # ✅ Return dict with ALL required keys
             return {
                 "success": False,
                 "cost": 0.0,
@@ -472,191 +467,143 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
     finally:
         session.close()
 
-# ✅ HYBRID: Chunk large orders, submit each chunk, sum results
-def submit_all_shipments(packages, carrier, fallback_client_code, batch_id, dry_run=True, max_workers=2, chunk_size=50):
-    """Submit packages in chunks for large orders, sum up costs"""
-    actual_workers = min(max_workers, 4)
+def submit_order_batch(order_packages, carrier, fallback_client_code, batch_id, dry_run=True, chunk_size=50):
+    """Submit a single order with chunking for large box counts"""
+    total_boxes = len(order_packages)
+    num_chunks = (total_boxes + chunk_size - 1) // chunk_size
     
-    # Group packages by OrderID
-    orders = defaultdict(list)
-    for pkg in packages:
-        orders[pkg["OrderID"]].append(pkg)
+    chunk_results = []
+    transaction_number = str(uuid.uuid4()).replace("-", "")[:20]
+    customer_order = order_packages[0]["OrderID"][:20]
     
-    all_results = []
+    actual_workers = min(4, num_chunks)
     
-    for order_id, order_packages in orders.items():
-        total_boxes = len(order_packages)
-        num_chunks = (total_boxes + chunk_size - 1) // chunk_size  # Ceiling division
-        
-        # Show progress for this order
-        if num_chunks > 1:
-            st.info(f"⏳ {order_id}: Processing {total_boxes} boxes in {num_chunks} chunks...")
-        
-        # Split into chunks
-        chunks = []
-        for i in range(0, total_boxes, chunk_size):
-            chunk_packages = order_packages[i:i + chunk_size]
-            chunks.append(chunk_packages)
-        
-        # Submit each chunk
-        chunk_results = []
-        transaction_number = str(uuid.uuid4()).replace("-", "")[:20]
-        customer_order = order_id[:20]
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=actual_workers) as executor:
-            futures = []
-            for chunk_num, chunk_packages in enumerate(chunks, 1):
-                # Build payload for this chunk
-                packages_array = []
-                for pkg in chunk_packages:
-                    packages_array.append({
-                        "Weight": pkg["Weight"],
-                        "Dimensions": {
-                            "Length": pkg["Length"],
-                            "Width": pkg["Width"],
-                            "Height": pkg["Height"],
-                            "PackagingWeight": pkg["PackagingWeight"]
-                        },
-                        "Items": [{
-                            "SKU": pkg["SKU"],
-                            "Description": pkg["Description"],
-                            "Quantity": 1
-                        }]
-                    })
-                
-                payload = {
-                    "TransactionNumber": f"{transaction_number}-{chunk_num:03d}",
-                    "CustomerOrder": customer_order,
-                    "BatchNumber": batch_id,
-                    "CarrierCode": CARRIER_SERVICE_MAP[carrier]["CarrierCode"],
-                    "Routing": {
-                        "CarrierCode": CARRIER_SERVICE_MAP[carrier]["CarrierCode"],
-                        "ServiceCode": chunk_packages[0]["ServiceLevel"],
-                        "FreightPaymentTerms": "Prepaid"
-                    },
-                    "ShipToAddress": chunk_packages[0]["Address"],
-                    "Packages": packages_array
-                }
-                
-                client_code_val = chunk_packages[0].get("ClientCode") or fallback_client_code
-                
-                future = executor.submit(submit_chunk, payload, client_code_val, order_id, batch_id, dry_run, chunk_num, num_chunks)
-                futures.append(future)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=actual_workers) as executor:
+        futures = []
+        for chunk_num, start_idx in enumerate(range(0, total_boxes, chunk_size), 1):
+            chunk_packages = order_packages[start_idx:start_idx + chunk_size]
             
-            # Collect chunk results
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    result = future.result()
-                    # ✅ Ensure result is valid dict with required keys
-                    if result and isinstance(result, dict) and "success" in result:
-                        chunk_results.append(result)
-                    else:
-                        # Create fallback result if none returned
-                        chunk_results.append({
-                            "success": False,
-                            "cost": 0.0,
-                            "base_amount": 0.0,
-                            "fuel_surcharge": 0.0,
-                            "public_total": 0.0,
-                            "service": "N/A",
-                            "carrier": carrier,
-                            "error": "No result returned from chunk",
-                            "boxes": 0,
-                            "chunk_num": len(chunk_results) + 1,
-                            "total_chunks": num_chunks
-                        })
-                except Exception as e:
-                    chunk_results.append({
-                        "success": False,
-                        "cost": 0.0,
-                        "base_amount": 0.0,
-                        "fuel_surcharge": 0.0,
-                        "public_total": 0.0,
-                        "service": "N/A",
-                        "carrier": carrier,
-                        "error": f"Future exception: {str(e)[:100]}",
-                        "boxes": 0,
-                        "chunk_num": len(chunk_results) + 1,
-                        "total_chunks": num_chunks
-                    })
+            packages_array = []
+            for pkg in chunk_packages:
+                packages_array.append({
+                    "Weight": pkg["Weight"],
+                    "Dimensions": {
+                        "Length": pkg["Length"],
+                        "Width": pkg["Width"],
+                        "Height": pkg["Height"],
+                        "PackagingWeight": pkg["PackagingWeight"]
+                    },
+                    "Items": [{
+                        "SKU": pkg["SKU"],
+                        "Description": pkg["Description"],
+                        "Quantity": 1
+                    }]
+                })
+            
+            payload = {
+                "TransactionNumber": f"{transaction_number}-{chunk_num:03d}",
+                "CustomerOrder": customer_order,
+                "BatchNumber": batch_id,
+                "CarrierCode": CARRIER_SERVICE_MAP[carrier]["CarrierCode"],
+                "Routing": {
+                    "CarrierCode": CARRIER_SERVICE_MAP[carrier]["CarrierCode"],
+                    "ServiceCode": chunk_packages[0]["ServiceLevel"],
+                    "FreightPaymentTerms": "Prepaid"
+                },
+                "ShipToAddress": chunk_packages[0]["Address"],
+                "Packages": packages_array
+            }
+            
+            client_code_val = chunk_packages[0].get("ClientCode") or fallback_client_code
+            
+            future = executor.submit(submit_chunk, payload, client_code_val, customer_order, batch_id, dry_run, chunk_num, num_chunks)
+            futures.append(future)
         
-        # ✅ Sum up all chunk results with MAXIMUM safety
-        total_cost = 0.0
-        total_base = 0.0
-        total_fuel = 0.0
-        total_public = 0.0
-        successful_chunks = 0
-        
-        for r in chunk_results:
-            if isinstance(r, dict) and r.get("success") is True:
-                try:
-                    total_cost += float(r.get("cost", 0) or 0)
-                    total_base += float(r.get("base_amount", 0) or 0)
-                    total_fuel += float(r.get("fuel_surcharge", 0) or 0)
-                    total_public += float(r.get("public_total", 0) or 0)
-                    successful_chunks += 1
-                except (TypeError, ValueError):
-                    pass  # Skip this chunk if values can't be converted
-        
-        failed_chunks = num_chunks - successful_chunks
-        
-        # Get service info from first successful chunk
-        service_info = "N/A"
-        carrier_info = carrier
-        error_info = None
-        for r in chunk_results:
-            if isinstance(r, dict) and r.get("success") is True:
-                service_info = r.get("service", "N/A") or "N/A"
-                carrier_info = r.get("carrier", carrier) or carrier
-                break
-        
-        if failed_chunks > 0:
-            error_parts = []
-            for r in chunk_results:
-                if isinstance(r, dict) and not r.get("success") and r.get("error"):
-                    error_parts.append(f"Chunk {r.get('chunk_num', '?')}: {r.get('error', 'Unknown')}")
-            if error_parts:
-                error_info = "; ".join(error_parts[:3])  # Show first 3 errors
-            if failed_chunks == num_chunks:
-                error_info = f"All {num_chunks} chunks failed: {error_info}"
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            if result and isinstance(result, dict) and "success" in result:
+                chunk_results.append(result)
             else:
-                error_info = f"{failed_chunks}/{num_chunks} chunks failed: {error_info}"
-        
-        status_text = "✅ Estimate (DryRun)" if dry_run else "✅ Saved to DB"
-        if failed_chunks > 0 and successful_chunks > 0:
-            status_text = f"⚠️ Partial ({successful_chunks}/{num_chunks} chunks)"
-        if failed_chunks == num_chunks:
-            status_text = "❌ Failed"
-        
-        all_results.append({
-            "Status": status_text,
-            "OrderID": order_id,
-            "TransactionNumber": transaction_number,
-            "BatchID": batch_id,
-            "Boxes": total_boxes,
-            "Cost": f"${total_cost:.2f}",
-            "BaseAmount": f"${total_base:.2f}",
-            "FuelSurcharge": f"${total_fuel:.2f}",
-            "PublicTotal": f"${total_public:.2f}",
-            "Service": service_info,
-            "Carrier": carrier_info,
-            "Recipient": order_packages[0]["Address"]["Name"],
-            "PostalCode": order_packages[0]["Address"]["Postal"],
-            "ExpectedDelivery": "N/A",
-            "Zone": "N/A",
-            "Chunks": f"{successful_chunks}/{num_chunks}",
-            "Error": error_info,
-            "DryRun": dry_run
-        })
-        
-        if num_chunks > 1:
-            if successful_chunks > 0:
-                st.success(f"✅ {order_id}: {total_boxes} boxes processed in {num_chunks} chunks. Total: ${total_cost:.2f}")
-            else:
-                st.error(f"❌ {order_id}: All {num_chunks} chunks failed. Check errors below.")
+                chunk_results.append({
+                    "success": False,
+                    "cost": 0.0,
+                    "base_amount": 0.0,
+                    "fuel_surcharge": 0.0,
+                    "public_total": 0.0,
+                    "service": "N/A",
+                    "carrier": carrier,
+                    "error": "No result returned from chunk",
+                    "boxes": 0,
+                    "chunk_num": len(chunk_results) + 1,
+                    "total_chunks": num_chunks
+                })
     
-    all_results.sort(key=lambda x: x.get("OrderID", ""))
-    return all_results
+    total_cost = 0.0
+    total_base = 0.0
+    total_fuel = 0.0
+    total_public = 0.0
+    successful_chunks = 0
+    
+    for r in chunk_results:
+        if isinstance(r, dict) and r.get("success") is True:
+            try:
+                total_cost += float(r.get("cost", 0) or 0)
+                total_base += float(r.get("base_amount", 0) or 0)
+                total_fuel += float(r.get("fuel_surcharge", 0) or 0)
+                total_public += float(r.get("public_total", 0) or 0)
+                successful_chunks += 1
+            except (TypeError, ValueError):
+                pass
+    
+    failed_chunks = num_chunks - successful_chunks
+    
+    service_info = "N/A"
+    carrier_info = carrier
+    error_info = None
+    for r in chunk_results:
+        if isinstance(r, dict) and r.get("success") is True:
+            service_info = r.get("service", "N/A") or "N/A"
+            carrier_info = r.get("carrier", carrier) or carrier
+            break
+    
+    if failed_chunks > 0:
+        error_parts = []
+        for r in chunk_results:
+            if isinstance(r, dict) and not r.get("success") and r.get("error"):
+                error_parts.append(f"Chunk {r.get('chunk_num', '?')}: {r.get('error', 'Unknown')}")
+        if error_parts:
+            error_info = "; ".join(error_parts[:3])
+        if failed_chunks == num_chunks:
+            error_info = f"All {num_chunks} chunks failed: {error_info}"
+        else:
+            error_info = f"{failed_chunks}/{num_chunks} chunks failed: {error_info}"
+    
+    status_text = "✅ Estimate (DryRun)" if dry_run else "✅ Saved to DB"
+    if failed_chunks > 0 and successful_chunks > 0:
+        status_text = f"⚠️ Partial ({successful_chunks}/{num_chunks} chunks)"
+    if failed_chunks == num_chunks:
+        status_text = "❌ Failed"
+    
+    return {
+        "Status": status_text,
+        "OrderID": order_packages[0]["OrderID"],
+        "TransactionNumber": transaction_number,
+        "BatchID": batch_id,
+        "Boxes": total_boxes,
+        "Cost": f"${total_cost:.2f}",
+        "BaseAmount": f"${total_base:.2f}",
+        "FuelSurcharge": f"${total_fuel:.2f}",
+        "PublicTotal": f"${total_public:.2f}",
+        "Service": service_info,
+        "Carrier": carrier_info,
+        "Recipient": order_packages[0]["Address"]["Name"],
+        "PostalCode": order_packages[0]["Address"]["Postal"],
+        "ExpectedDelivery": "N/A",
+        "Zone": "N/A",
+        "Chunks": f"{successful_chunks}/{num_chunks}",
+        "Error": error_info,
+        "DryRun": dry_run
+    }
 
 def add_selectable_css():
     st.markdown("""
@@ -673,7 +620,7 @@ def add_selectable_css():
 def main():
     add_selectable_css()
     st.title("📦 TechSHIP Bulk Rate Estimator")
-    st.markdown("### Hybrid Chunking Mode — Large Orders Split Automatically")
+    st.markdown("### Batch Processing Mode — 100 Orders at a Time")
 
     fallback_client_code = st.text_input("Fallback Client Code", value="omrtest1")
     if not fallback_client_code.strip():
@@ -682,9 +629,13 @@ def main():
 
     dry_run = st.checkbox("🔒 Dry Run Mode (Estimates Only - Not Saved to DB)", value=True)
 
-    col1, col2 = st.columns(2)
-    with col1:
-        trigger_rs = st.button("🎯 Trigger RS (RateShopping)", type="secondary")
+    # ✅ BATCH PROCESSING SETTINGS
+    batch_size = st.sidebar.slider("📦 Batch Size (orders per batch)", 50, 500, 100, 
+                                   help="Number of orders to process in each batch")
+    chunk_size = st.sidebar.slider("📦 Chunk Size (boxes per API call)", 25, 100, 50, 
+                                   help="Boxes per API call for large orders")
+    max_workers = st.sidebar.slider("Parallel Workers", 1, 8, 4, 
+                                    help="Lower = more stable for large orders")
 
     with st.sidebar:
         st.header("📋 Usage Guide")
@@ -700,22 +651,18 @@ def main():
         - Leave `services` blank → RateShopping (RS)
         **Dimensions**: `lwh` or `length/width/height`  
         **Weights**: `weight`, `weight2`, ...
-        **✅ Hybrid Chunking**: Orders >50 boxes auto-split into 50-box chunks
+        **✅ Batch Processing**: Process 100 orders at a time, continue anytime
         """)
         
-        st.info("⏳ **Chunking Settings:**")
-        st.markdown("""
-        | Boxes | API Calls | Est. Time |
-        |-------|-----------|-----------|
-        | 1-50 | 1 call | ~30s |
-        | 51-100 | 2 calls | ~60s |
-        | 101-500 | 3-10 calls | ~5 min |
-        | 501-2000 | 11-40 calls | ~15 min |
+        st.info("⏳ **Processing Settings:**")
+        st.markdown(f"""
+        | Setting | Value |
+        |---------|-------|
+        | Batch Size | {batch_size} orders |
+        | Chunk Size | {chunk_size} boxes |
+        | Workers | {max_workers} |
+        | Est. Time/Batch | ~{batch_size * 30 // 60} min |
         """)
-        
-        chunk_size = st.slider("Chunk Size (boxes per API call)", 25, 100, 50, 
-                               help="Smaller = more stable, Larger = fewer API calls")
-        st.session_state.chunk_size = chunk_size
         
         if dry_run:
             st.warning("⚠️ **Dry Run Mode ON** — Estimates NOT saved to database.")
@@ -725,71 +672,153 @@ def main():
         st.markdown("---")
         st.markdown("**🌐 TechSHIP Web Portal:**")
         st.code("https://18wheels.techship.ca/", language="text")
-        st.markdown("Search by `BatchID` or `TransactionNumber` from results below.")
 
     col1, col2 = st.columns(2)
     with col1:
-        uploaded_file = st.file_uploader("📁 Upload CSV/Excel", type=['csv', 'xlsx', 'xls'])
+        uploaded_file = st.file_uploader("📁 Upload CSV/Excel", type=['csv', 'xlsx', 'xls'], 
+                                         disabled=st.session_state.get("processing_started", False))
     with col2:
-        text_input = st.text_area("📋 Or Paste Data", height=150)
+        text_input = st.text_area("📋 Or Paste Data", height=150, 
+                                  disabled=st.session_state.get("processing_started", False))
 
+    # ✅ INITIALIZE SESSION STATE FOR BATCH PROCESSING
     if "all_results" not in st.session_state:
         st.session_state.all_results = []
+    if "batch_id" not in st.session_state:
         st.session_state.batch_id = ""
+    if "total_orders" not in st.session_state:
         st.session_state.total_orders = 0
-        st.session_state.processing_done = True
+    if "processed_orders" not in st.session_state:
+        st.session_state.processed_orders = 0
+    if "packages" not in st.session_state:
+        st.session_state.packages = []
+    if "carrier" not in st.session_state:
+        st.session_state.carrier = ""
+    if "processing_started" not in st.session_state:
+        st.session_state.processing_started = False
+    if "processing_complete" not in st.session_state:
+        st.session_state.processing_complete = False
 
-    if st.button("🚀 Get Rate Estimates", type="primary"):
-        st.session_state.processing_done = False
-        st.session_state.all_results = []
+    # ✅ CHECK IF THERE'S IN-PROGRESS DATA
+    has_in_progress = st.session_state.processing_started and not st.session_state.processing_complete
+
+    if has_in_progress:
+        st.info(f"🔄 **Processing In Progress:** {st.session_state.processed_orders}/{st.session_state.total_orders} orders completed ({st.session_state.processed_orders * 100 // max(st.session_state.total_orders, 1)}%)")
         
-        chunk_size = st.session_state.get("chunk_size", 50)
+        # Progress bar
+        progress = st.session_state.processed_orders / max(st.session_state.total_orders, 1)
+        st.progress(progress)
         
-        with st.spinner("🔍 Parsing data..."):
-            df = parse_input_data(text_input, uploaded_file)
-            if df is None: 
-                st.session_state.processing_done = True
-                st.stop()
-            result = validate_and_process_data(df, fallback_client_code.strip(), force_rs=trigger_rs)
-            if result is None: 
-                st.session_state.processing_done = True
-                st.stop()
-            packages, carrier = result
-            st.session_state.total_orders = len(set(pkg["OrderID"] for pkg in packages))
-            total_boxes = len(packages)
-            st.success(f"✅ Parsed {st.session_state.total_orders} unique orders ({total_boxes} total packages)")
+        # Show partial results
+        if st.session_state.all_results:
+            st.subheader("📊 Partial Results So Far")
+            partial_df = pd.DataFrame(st.session_state.all_results)
+            st.dataframe(partial_df[["OrderID", "Status", "Boxes", "Cost", "Service"]], use_container_width=True)
             
-            if total_boxes > 500:
-                estimated_calls = (total_boxes + chunk_size - 1) // chunk_size
-                estimated_time = estimated_calls * 30  # ~30s per API call
-                st.warning(f"⏳ **Large Shipment:** {total_boxes} boxes = ~{estimated_calls} API calls. Estimated time: ~{estimated_time // 60} minutes. Please do not close this window.")
-
-        st.subheader("⚙️ Configuration")
-        max_workers = st.slider("Parallel Workers", 1, 4, 2, help="Lower workers = more stable for large orders")
-
-        batch_id = str(uuid.uuid4()).replace("-", "")[:20]
-        st.session_state.batch_id = batch_id
-
-        with st.spinner(f"📤 Getting estimates for {total_boxes} packages (chunk size: {chunk_size})..."):
-            all_results = submit_all_shipments(
-                packages, carrier, fallback_client_code.strip(),
-                batch_id=batch_id,
-                dry_run=dry_run,
-                max_workers=max_workers,
-                chunk_size=chunk_size
+            # Download partial results
+            csv = partial_df.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                "💾 Download Partial Results",
+                csv,
+                f"techship_estimates_partial_{st.session_state.batch_id}.csv",
+                "text/csv"
             )
-            st.session_state.all_results = all_results
-            st.session_state.processing_done = True
+        
+        # Continue button
+        col1, col2, col3 = st.columns([2, 2, 1])
+        with col1:
+            if st.button("▶️ Continue Processing Next Batch", type="primary", use_container_width=True):
+                # Continue processing
+                pass  # Logic below handles this
+        with col2:
+            if st.button("🔄 Refresh Status", use_container_width=True):
+                st.rerun()
+        with col3:
+            if st.button("❌ Cancel", use_container_width=True):
+                st.session_state.processing_started = False
+                st.session_state.processing_complete = True
+                st.warning("Processing cancelled. You can restart with new data.")
+                st.rerun()
+    else:
+        # New processing
+        if st.button("🚀 Start Processing", type="primary"):
+            st.session_state.processing_started = True
+            st.session_state.processing_complete = False
+            st.session_state.all_results = []
+            st.session_state.processed_orders = 0
+            
+            with st.spinner("🔍 Parsing data..."):
+                df = parse_input_data(text_input, uploaded_file)
+                if df is None: 
+                    st.session_state.processing_started = False
+                    st.stop()
+                result = validate_and_process_data(df, fallback_client_code.strip(), force_rs=False)
+                if result is None: 
+                    st.session_state.processing_started = False
+                    st.stop()
+                packages, carrier = result
+                st.session_state.packages = packages
+                st.session_state.carrier = carrier
+                st.session_state.total_orders = len(set(pkg["OrderID"] for pkg in packages))
+                st.success(f"✅ Parsed {st.session_state.total_orders} unique orders ({len(packages)} total packages)")
+            
+            # Generate batch ID
+            batch_id = str(uuid.uuid4()).replace("-", "")[:20]
+            st.session_state.batch_id = batch_id
+            
+            st.rerun()
 
-        st.success(f"✅ Completed! Processed {len(all_results)} orders")
+    # ✅ PROCESS NEXT BATCH IF CONTINUE WAS CLICKED OR FIRST RUN
+    if st.session_state.processing_started and not st.session_state.processing_complete:
+        # Group packages by OrderID
+        orders = defaultdict(list)
+        for pkg in st.session_state.packages:
+            orders[pkg["OrderID"]].append(pkg)
+        
+        order_ids = list(orders.keys())
+        start_idx = st.session_state.processed_orders
+        end_idx = min(start_idx + batch_size, len(order_ids))
+        
+        if start_idx < len(order_ids):
+            batch_order_ids = order_ids[start_idx:end_idx]
+            batch_orders = {oid: orders[oid] for oid in batch_order_ids}
+            
+            with st.spinner(f"📤 Processing batch {start_idx // batch_size + 1}: Orders {start_idx + 1}-{end_idx} of {len(order_ids)}..."):
+                batch_results = []
+                for i, (order_id, order_packages) in enumerate(batch_orders.items()):
+                    result = submit_order_batch(
+                        order_packages, 
+                        st.session_state.carrier, 
+                        fallback_client_code.strip(),
+                        st.session_state.batch_id,
+                        dry_run=dry_run,
+                        chunk_size=chunk_size
+                    )
+                    batch_results.append(result)
+                    st.session_state.processed_orders += 1
+                
+                # Add batch results to all results
+                st.session_state.all_results.extend(batch_results)
+                
+                st.success(f"✅ Batch complete! Processed {len(batch_results)} orders. Total: {st.session_state.processed_orders}/{st.session_state.total_orders}")
+                
+                # Check if complete
+                if st.session_state.processed_orders >= st.session_state.total_orders:
+                    st.session_state.processing_complete = True
+                    st.balloons()
+                    st.success(f"🎉 All {st.session_state.total_orders} orders processed!")
+                
+                st.rerun()
+        else:
+            st.session_state.processing_complete = True
 
-    # Display results
-    if st.session_state.all_results:
+    # ✅ DISPLAY FINAL RESULTS
+    if st.session_state.all_results and st.session_state.processing_complete:
         all_results = st.session_state.all_results
         success_count = sum(1 for r in all_results if "✅" in r.get("Status", ""))
         failed_count = len(all_results) - success_count
 
-        st.subheader("📊 Results - All Orders")
+        st.subheader("📊 Final Results - All Orders")
         col1, col2, col3 = st.columns(3)
         col1.metric("Total Orders", st.session_state.total_orders)
         col2.metric("Success", success_count)
@@ -812,8 +841,6 @@ def main():
                 "Carrier": r.get("Carrier", ""),
                 "Recipient": r.get("Recipient", ""),
                 "PostalCode": r.get("PostalCode", ""),
-                "ExpectedDelivery": r.get("ExpectedDelivery", "N/A"),
-                "Zone": r.get("Zone", "N/A")
             }
             if r.get("Error"):
                 row["Error"] = r["Error"]
@@ -831,7 +858,7 @@ def main():
 
         csv = results_df.to_csv(index=False).encode('utf-8')
         st.download_button(
-            "💾 Download All Estimates",
+            "💾 Download All Results",
             csv,
             f"techship_estimates_{st.session_state.batch_id}.csv",
             "text/csv"
@@ -841,6 +868,13 @@ def main():
             st.success(f"✅ **Saved to Database!** View in TechSHIP: [https://18wheels.techship.ca/](https://18wheels.techship.ca/) — Search BatchID: `{st.session_state.batch_id}`")
         else:
             st.info(f"ℹ️ **Dry Run Mode** — Not saved to database. BatchID: `{st.session_state.batch_id}`")
+        
+        # Reset button for new file
+        if st.button("🔄 Start New Processing"):
+            for key in ["all_results", "batch_id", "total_orders", "processed_orders", "packages", "carrier", "processing_started", "processing_complete"]:
+                if key in st.session_state:
+                    st.session_state[key] = [] if key in ["all_results", "packages"] else "" if key in ["batch_id", "carrier"] else 0 if key in ["total_orders", "processed_orders"] else False
+            st.rerun()
 
 if __name__ == "__main__":
     main()
