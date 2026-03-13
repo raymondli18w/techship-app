@@ -93,6 +93,7 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
         clean_columns.append(cleaned)
     df.columns = clean_columns
 
+    # ✅ Drop any empty column names (caused by trailing commas in CSV)
     df = df.loc[:, df.columns != '']
 
     column_mapping = {
@@ -185,6 +186,7 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
     packages = []
 
     for idx, row in df.iterrows():
+        # ✅ FIXED: Use .get() to avoid KeyError on missing columns
         def safe_string(col, default=""): 
             val = row.get(col)
             if pd.isna(val):
@@ -226,7 +228,15 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
             user_order_id = str(uuid.uuid4()).replace("-", "")[:20]
         
         packaging_weight = safe_float('packaging_weight', 0.0)
+        
+        # ✅ FIX: Properly handle 'boxes' column - default to 1 if empty/invalid
         num_boxes = safe_int('boxes', 1)
+        
+        # Safety cap to prevent API overload from typos (e.g., 2000 instead of 2)
+        if num_boxes > 100:
+            st.warning(f"⚠️ Row {int(idx) + 2}: Large box count ({num_boxes}) detected. Limiting to 100 for API stability.")
+            num_boxes = 100
+        
         row_client_code = safe_string('client_code') or fallback_client_code
 
         postal_prefix = safe_string('postal_prefix')
@@ -310,28 +320,40 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
         if not weight_values:
             weight_values = {"weight": 1.0}
 
-        unique_shipment_id = str(uuid.uuid4()).replace("-", "")[:16]
-        packages.append({
-            "SKU": safe_string('sku', "N/A"),
-            "Weight": list(weight_values.values())[0] if weight_values else 1.0,
-            "Description": safe_string('description', "No description"),
-            "Length": dimension_sets[0]["length"] if dimension_sets else 10,
-            "Width": dimension_sets[0]["width"] if dimension_sets else 10,
-            "Height": dimension_sets[0]["height"] if dimension_sets else 10,
-            "PackagingWeight": packaging_weight,
-            "Address": address,
-            "ServiceLevel": service_level,
-            "Carrier": carrier,
-            "ClientCode": row_client_code,
-            "NumBoxes": num_boxes,
-            "UNIQUE_SHIPMENT_ID": unique_shipment_id,
-            "OrderID": user_order_id,
-            "Row_Index": idx
-        })
+        # ✅ FIX: Create ONE package per order with TOTAL weight (weight × boxes)
+        # This ensures the API prices the entire shipment, not just one box
+        for dim in dimension_sets:
+            for weight_col, weight_val in weight_values.items():
+                # Calculate total weight for all boxes
+                total_weight = weight_val * num_boxes
+                total_packaging = packaging_weight * num_boxes
+                
+                unique_shipment_id = str(uuid.uuid4()).replace("-", "")[:16]
+                packages.append({
+                    "SKU": safe_string('sku', "N/A"),
+                    "Weight": total_weight,  # ✅ Total weight = per-box weight × num_boxes
+                    "Description": safe_string('description', "No description"),
+                    "Length": dim["length"],
+                    "Width": dim["width"],
+                    "Height": dim["height"],
+                    "PackagingWeight": total_packaging,  # ✅ Total packaging weight
+                    "Address": address,
+                    "ServiceLevel": service_level,
+                    "Carrier": carrier,
+                    "ClientCode": row_client_code,
+                    "LWH_Source": dim["source"],
+                    "Weight_Source": weight_col,
+                    "NumBoxes": num_boxes,  # ✅ Track original box count for display
+                    "UNIQUE_SHIPMENT_ID": unique_shipment_id,
+                    "OrderID": user_order_id,
+                    "Row_Index": idx
+                })
 
     if not packages:
         st.error("❌ No valid packages created.")
         return None
+    
+    st.info(f"ℹ️ Created {len(packages)} shipment estimates from {len(df)} CSV rows")
     return packages, carrier
 
 def submit_single_shipment(payload, client_code, order_id, batch_id, dry_run=True, num_boxes=1):
@@ -401,6 +423,7 @@ def submit_single_shipment(payload, client_code, order_id, batch_id, dry_run=Tru
             zone = best_rate.get("Zone", "N/A")
             fuel_surcharge = best_rate.get("FuelSurcharge", 0)
             base_amount = best_rate.get("BaseAmount", 0)
+            public_total = best_rate.get("PublicTotalAmount", total_cost)
         else:
             total_cost = 0
             service_code = payload.get("Routing", {}).get("ServiceCode", "N/A")
@@ -409,6 +432,7 @@ def submit_single_shipment(payload, client_code, order_id, batch_id, dry_run=Tru
             zone = "N/A"
             fuel_surcharge = 0
             base_amount = 0
+            public_total = 0
 
         status_text = "✅ Estimate (DryRun)" if dry_run else "✅ Saved to DB"
 
@@ -420,6 +444,7 @@ def submit_single_shipment(payload, client_code, order_id, batch_id, dry_run=Tru
             "Cost": f"${total_cost:.2f}",
             "BaseAmount": f"${base_amount:.2f}",
             "FuelSurcharge": f"${fuel_surcharge:.2f}",
+            "PublicTotal": f"${public_total:.2f}",
             "Service": f"{service_name} ({service_code})",
             "Carrier": payload.get("CarrierCode", "N/A"),
             "Recipient": payload["ShipToAddress"]["Name"],
@@ -441,6 +466,7 @@ def submit_single_shipment(payload, client_code, order_id, batch_id, dry_run=Tru
             "Cost": "$0.00",
             "BaseAmount": "$0.00",
             "FuelSurcharge": "$0.00",
+            "PublicTotal": "$0.00",
             "Service": payload.get("Routing", {}).get("ServiceCode", "unknown"),
             "Carrier": payload.get("CarrierCode", "unknown"),
             "Recipient": payload.get("ShipToAddress", {}).get("Name", "unknown"),
@@ -529,7 +555,7 @@ def add_selectable_css():
 def main():
     add_selectable_css()
     st.title("📦 TechSHIP Bulk Rate Estimator")
-    st.markdown("### All Orders Displayed - No Batching")
+    st.markdown("### All Orders Displayed - Boxes Pricing Fixed")
 
     fallback_client_code = st.text_input("Fallback Client Code", value="omrtest1")
     if not fallback_client_code.strip():
@@ -556,6 +582,7 @@ def main():
         - Leave `services` blank → RateShopping (RS)
         **Dimensions**: `lwh` or `length/width/height`  
         **Weights**: `weight`, `weight2`, ...
+        **✅ Boxes**: `boxes` column now properly multiplies weight for accurate pricing
         """)
         
         if dry_run:
@@ -566,6 +593,7 @@ def main():
         st.markdown("---")
         st.markdown("**🌐 TechSHIP Web Portal:**")
         st.code("https://18wheels.techship.ca/", language="text")
+        st.markdown("Search by `BatchID` or `TransactionNumber` from results below.")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -633,10 +661,11 @@ def main():
                 "Status": r.get("Status", "Unknown"),
                 "BatchID": r.get("BatchID", "N/A"),
                 "TransactionNumber": r.get("TransactionNumber", "N/A"),
-                "Boxes": r.get("Boxes", 0),
-                "Cost": r.get("Cost", "$0.00"),
+                "Boxes": r.get("Boxes", 0),  # ✅ Now shows correct box count
+                "Cost": r.get("Cost", "$0.00"),  # ✅ TotalAmount (authoritative)
                 "BaseAmount": r.get("BaseAmount", ""),
                 "FuelSurcharge": r.get("FuelSurcharge", ""),
+                "PublicTotal": r.get("PublicTotal", ""),  # ✅ Public-facing total
                 "Service": r.get("Service", ""),
                 "Carrier": r.get("Carrier", ""),
                 "Recipient": r.get("Recipient", ""),
@@ -651,8 +680,8 @@ def main():
         results_df = pd.DataFrame(display_data)
         display_cols = [
             "OrderID", "Status", "BatchID", "TransactionNumber",
-            "Boxes", "Cost", "BaseAmount", "FuelSurcharge", "Service", "Carrier",
-            "Recipient", "PostalCode", "ExpectedDelivery", "Zone"
+            "Boxes", "Cost", "BaseAmount", "FuelSurcharge", "PublicTotal", 
+            "Service", "Carrier", "Recipient", "PostalCode", "ExpectedDelivery", "Zone"
         ]
         if "Error" in results_df.columns:
             display_cols.append("Error")
