@@ -53,9 +53,20 @@ for carrier, info in CARRIER_SERVICE_MAP.items():
 # Helper Functions
 # =========================
 def create_robust_session():
+    """Create session with extended timeouts and connection pooling"""
     session = requests.Session()
-    retry_strategy = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
-    adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=100, pool_maxsize=100)
+    retry_strategy = Retry(
+        total=3,
+        backoff_factor=2,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["POST"]
+    )
+    adapter = HTTPAdapter(
+        max_retries=retry_strategy,
+        pool_connections=200,
+        pool_maxsize=200,
+        pool_block=False
+    )
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
@@ -93,6 +104,7 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
         clean_columns.append(cleaned)
     df.columns = clean_columns
 
+    # ✅ Drop any empty column names (caused by trailing commas in CSV)
     df = df.loc[:, df.columns != '']
 
     column_mapping = {
@@ -228,8 +240,12 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
         packaging_weight = safe_float('packaging_weight', 0.0)
         num_boxes = safe_int('boxes', 1)
         
-        if num_boxes > 50:
-            st.warning(f"⚠️ Row {int(idx) + 2}: Large box count ({num_boxes}). Consider splitting into multiple orders.")
+        # ✅ WARNING: Large box counts will take longer but will NOT be split
+        if num_boxes > 100:
+            estimated_time = num_boxes * 0.5  # ~0.5 sec per box
+            st.warning(f"⏳ Row {int(idx) + 2}: **{num_boxes} boxes** detected. Estimated processing time: ~{estimated_time:.0f} seconds. This is normal — please wait.")
+        if num_boxes > 1000:
+            st.warning(f"⚠️ Row {int(idx) + 2}: **{num_boxes} boxes** is a very large shipment. Processing may take several minutes.")
         
         row_client_code = safe_string('client_code') or fallback_client_code
 
@@ -314,15 +330,15 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
         if not weight_values:
             weight_values = {"weight": 1.0}
 
-        # ✅ FIX: Create INDIVIDUAL package object for EACH box
+        # ✅ Create INDIVIDUAL package object for EACH box (no splitting)
         for dim in dimension_sets:
             for weight_col, weight_val in weight_values.items():
                 for box_num in range(num_boxes):
                     unique_shipment_id = str(uuid.uuid4()).replace("-", "")[:16]
                     packages.append({
                         "SKU": safe_string('sku', "N/A"),
-                        "Weight": weight_val,  # ✅ Individual box weight (NOT multiplied)
-                        "Description": f"{safe_string('description', 'No description')} - Box {box_num + 1}",
+                        "Weight": weight_val,
+                        "Description": f"{safe_string('description', 'No description')} - Box {box_num + 1}/{num_boxes}",
                         "Length": dim["length"],
                         "Width": dim["width"],
                         "Height": dim["height"],
@@ -343,7 +359,7 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
         st.error("❌ No valid packages created.")
         return None
     
-    # Group by OrderID to show how many packages per order
+    # Show package summary
     order_counts = defaultdict(int)
     for pkg in packages:
         order_counts[pkg["OrderID"]] += 1
@@ -354,13 +370,32 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
     
     return packages, carrier
 
+# ✅ UPDATED: Extended timeout with retry logic for large orders
 def submit_single_shipment(payload, client_code, order_id, batch_id, dry_run=True, num_boxes=1):
     session = create_robust_session()
     original_payload = payload.copy()
+    
+    # ✅ Dynamic timeout based on package count (NO upper limit)
+    if num_boxes <= 50:
+        timeout = 60
+    elif num_boxes <= 100:
+        timeout = 120
+    elif num_boxes <= 500:
+        timeout = 300  # 5 minutes
+    elif num_boxes <= 1000:
+        timeout = 600  # 10 minutes
+    else:
+        timeout = 900  # 15 minutes for 2000+ boxes
+    
     try:
         payload["ClientCode"] = client_code
         params = {"dryRun": "true" if dry_run else "false"}
-        response = session.post(API_URL, headers=HEADERS, json=payload, params=params, timeout=30)
+        
+        # Show timeout info for large orders
+        if num_boxes > 100:
+            st.info(f"⏳ Processing {num_boxes} boxes... Timeout set to {timeout}s. Please wait.")
+        
+        response = session.post(API_URL, headers=HEADERS, json=payload, params=params, timeout=timeout)
 
         if response.status_code != 200:
             error_text = response.text[:200] if response.text else "No details"
@@ -455,6 +490,28 @@ def submit_single_shipment(payload, client_code, order_id, batch_id, dry_run=Tru
             "DryRun": dry_run
         }
 
+    except requests.exceptions.Timeout:
+        return {
+            "Status": "❌ Timeout",
+            "OrderID": order_id,
+            "TransactionNumber": payload.get("TransactionNumber", "unknown"),
+            "TrackingNumber": "N/A",
+            "Cost": "$0.00",
+            "BaseAmount": "$0.00",
+            "FuelSurcharge": "$0.00",
+            "PublicTotal": "$0.00",
+            "Service": payload.get("Routing", {}).get("ServiceCode", "unknown"),
+            "Carrier": payload.get("CarrierCode", "unknown"),
+            "Recipient": payload.get("ShipToAddress", {}).get("Name", "unknown"),
+            "PostalCode": payload.get("ShipToAddress", {}).get("Postal", "unknown"),
+            "Boxes": num_boxes,
+            "ExpectedDelivery": "N/A",
+            "Zone": "N/A",
+            "Error": f"Request timed out after {timeout}s. The API took too long. Try again or contact support.",
+            "ClientCode": client_code,
+            "BatchID": batch_id,
+            "DryRun": dry_run
+        }
     except Exception as e:
         return {
             "Status": "❌ Failed",
@@ -482,9 +539,9 @@ def submit_single_shipment(payload, client_code, order_id, batch_id, dry_run=Tru
 
 def submit_all_shipments(packages, carrier, fallback_client_code, batch_id, dry_run=True, max_workers=4):
     """Submit packages grouped by OrderID - each order gets ALL its boxes in one API call"""
-    actual_workers = min(max_workers, 8)
+    actual_workers = min(max_workers, 4)  # Limit workers for large orders
     
-    # ✅ Group packages by OrderID
+    # Group packages by OrderID
     orders = defaultdict(list)
     for pkg in packages:
         orders[pkg["OrderID"]].append(pkg)
@@ -494,11 +551,11 @@ def submit_all_shipments(packages, carrier, fallback_client_code, batch_id, dry_
         customer_order = order_id[:20]
         transaction_number = str(uuid.uuid4()).replace("-", "")[:20]
         
-        # ✅ Build Packages array with ALL individual boxes for this order
+        # Build Packages array with ALL individual boxes for this order
         packages_array = []
         for pkg in order_packages:
             packages_array.append({
-                "Weight": pkg["Weight"],  # Individual box weight
+                "Weight": pkg["Weight"],
                 "Dimensions": {
                     "Length": pkg["Length"],
                     "Width": pkg["Width"],
@@ -523,7 +580,7 @@ def submit_all_shipments(packages, carrier, fallback_client_code, batch_id, dry_
                 "FreightPaymentTerms": "Prepaid"
             },
             "ShipToAddress": order_packages[0]["Address"],
-            "Packages": packages_array  # ✅ Array of ALL individual boxes
+            "Packages": packages_array
         }
         
         client_code_val = order_packages[0].get("ClientCode") or fallback_client_code
@@ -532,16 +589,27 @@ def submit_all_shipments(packages, carrier, fallback_client_code, batch_id, dry_
         payloads.append((payload, client_code_val, customer_order, batch_id, num_boxes))
     
     results = []
+    total_orders = len(payloads)
+    
     with concurrent.futures.ThreadPoolExecutor(max_workers=actual_workers) as executor:
         futures = [executor.submit(submit_single_shipment, payload, client_code_val, order_id, bid, dry_run, num_boxes) 
                    for payload, client_code_val, order_id, bid, num_boxes in payloads]
         
+        # Show progress with order count
         progress_bar = st.progress(0)
+        status_text = st.empty()
+        
         for i, future in enumerate(concurrent.futures.as_completed(futures)):
             results.append(future.result())
-            progress_bar.progress((i + 1) / len(futures))
+            progress = (i + 1) / total_orders
+            progress_bar.progress(progress)
+            
+            # Show which order is processing
+            completed_orders = [r.get("OrderID", "?") for r in results]
+            status_text.text(f"⏳ Processing: {i + 1}/{total_orders} orders completed")
         
         progress_bar.empty()
+        status_text.empty()
     
     results.sort(key=lambda x: x.get("OrderID", ""))
     return results
@@ -561,7 +629,7 @@ def add_selectable_css():
 def main():
     add_selectable_css()
     st.title("📦 TechSHIP Bulk Rate Estimator")
-    st.markdown("### Accurate Multi-Box Pricing - Matches TechSHIP Website")
+    st.markdown("### Extended Timeout Mode — Large Orders Supported (2000+ Boxes)")
 
     fallback_client_code = st.text_input("Fallback Client Code", value="omrtest1")
     if not fallback_client_code.strip():
@@ -588,7 +656,18 @@ def main():
         - Leave `services` blank → RateShopping (RS)
         **Dimensions**: `lwh` or `length/width/height`  
         **Weights**: `weight`, `weight2`, ...
-        **✅ Boxes**: Each box is sent as individual package for accurate pricing
+        **✅ Large Orders**: 2000+ boxes supported with extended timeouts
+        """)
+        
+        st.info("⏳ **Timeout Settings:**")
+        st.markdown("""
+        | Boxes | Timeout |
+        |-------|---------|
+        | 1-50 | 60s |
+        | 51-100 | 120s |
+        | 101-500 | 300s (5 min) |
+        | 501-1000 | 600s (10 min) |
+        | 1000+ | 900s (15 min) |
         """)
         
         if dry_run:
@@ -627,15 +706,19 @@ def main():
                 st.stop()
             packages, carrier = result
             st.session_state.total_orders = len(set(pkg["OrderID"] for pkg in packages))
-            st.success(f"✅ Parsed {st.session_state.total_orders} unique orders ({len(packages)} total packages)")
+            total_boxes = len(packages)
+            st.success(f"✅ Parsed {st.session_state.total_orders} unique orders ({total_boxes} total packages)")
+            
+            if total_boxes > 500:
+                st.warning(f"⏳ **Large Shipment:** {total_boxes} boxes detected. Processing may take 5-15 minutes. Please do not close this window.")
 
         st.subheader("⚙️ Configuration")
-        max_workers = st.slider("Parallel Workers", 1, 8, 4)
+        max_workers = st.slider("Parallel Workers", 1, 4, 2, help="Lower workers = more stable for large orders")
 
         batch_id = str(uuid.uuid4()).replace("-", "")[:20]
         st.session_state.batch_id = batch_id
 
-        with st.spinner(f"📤 Getting estimates for {len(packages)} packages..."):
+        with st.spinner(f"📤 Getting estimates for {total_boxes} packages..."):
             all_results = submit_all_shipments(
                 packages, carrier, fallback_client_code.strip(),
                 batch_id=batch_id,
