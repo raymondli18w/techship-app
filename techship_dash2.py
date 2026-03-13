@@ -3,11 +3,10 @@ import pandas as pd
 import requests
 import uuid
 import concurrent.futures
-import threading
 import time
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from io import StringIO, BytesIO
+from io import BytesIO
 from collections import defaultdict
 
 # SQLite Address Lookup
@@ -19,7 +18,7 @@ from sqlite_lookup import get_address_by_prefix
 st.set_page_config(page_title="TechSHIP Bulk Rate Estimator", page_icon="📦", layout="wide")
 
 # =========================
-# TechSHIP API Configuration (ESTIMATE API)
+# TechSHIP API Configuration
 # =========================
 API_URL = "https://18wheels.techship.ca/api/v3/shipments/estimate"
 API_KEY = "bfdcbf84-f76d-b85b-8eae-fa925d6fa863"
@@ -54,311 +53,11 @@ for carrier, info in CARRIER_SERVICE_MAP.items():
 # =========================
 def create_robust_session():
     session = requests.Session()
-    retry_strategy = Retry(
-        total=3,
-        backoff_factor=2,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["POST"]
-    )
-    adapter = HTTPAdapter(
-        max_retries=retry_strategy,
-        pool_connections=200,
-        pool_maxsize=200,
-        pool_block=False
-    )
+    retry_strategy = Retry(total=3, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=200, pool_maxsize=200)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
-
-def parse_input_data(text_data, uploaded_file):
-    if uploaded_file is not None:
-        try:
-            if uploaded_file.name.endswith('.csv'):
-                return pd.read_csv(BytesIO(uploaded_file.getvalue()))
-            elif uploaded_file.name.endswith(('.xls', '.xlsx')):
-                return pd.read_excel(BytesIO(uploaded_file.getvalue()))
-            else:
-                st.error("❌ Unsupported file type. Please use CSV or Excel.")
-                return None
-        except Exception as e:
-            st.error(f"❌ File parsing error: {str(e)}")
-            return None
-    else:
-        if not text_data or not text_data.strip():
-            st.error("❌ Please provide data via text or file upload.")
-            return None
-        delimiter = '\t' if '\t' in text_data[:500] else ','
-        try:
-            return pd.read_csv(StringIO(text_data), delimiter=delimiter, skipinitialspace=True)
-        except Exception as e:
-            st.error(f"❌ Data parsing error: {str(e)}")
-            return None
-
-def validate_and_process_data(df, fallback_client_code, force_rs=False):
-    clean_columns = []
-    for col in df.columns:
-        cleaned = str(col).strip().lower()
-        cleaned = cleaned.replace(' ', '_').replace('-', '_').replace('.', '_')
-        cleaned = '_'.join([part for part in cleaned.split('_') if part])
-        clean_columns.append(cleaned)
-    df.columns = clean_columns
-
-    df = df.loc[:, df.columns != '']
-
-    column_mapping = {
-        'Services': 'services', 'service': 'services', 'service_code': 'services',
-        'address1': 'address', 'street': 'address', 'street1': 'address',
-        'address2': 'address2', 'street2': 'address2', 'suite': 'address2',
-        'state': 'province', 'zip': 'postal', 'zipcode': 'postal',
-        'item_sku': 'sku', 'product_sku': 'sku',
-        'item_description': 'description', 'desc': 'description',
-        'pkg_weight': 'packaging_weight', 'num_boxes': 'boxes',
-        'contact_name': 'name', 'phone_number': 'phone', 'email_address': 'email',
-        'postalzip2': 'postal_prefix',
-        'clientcode': 'client_code',
-        'client_code': 'client_code',
-        'order_id': 'order_id',
-        'orderid': 'order_id',
-        'purchase_order': 'order_id',
-        'po_number': 'order_id',
-        'carrier': 'carrier',
-        'carreir': 'carrier',
-        'carrier_code': 'carrier',
-        'length': 'length',
-        'width': 'width',
-        'height': 'height'
-    }
-    df.columns = [column_mapping.get(col, col) for col in df.columns]
-
-    essential_columns = ['name', 'services']
-    missing_columns = [col for col in essential_columns if col not in df.columns]
-    if missing_columns:
-        st.error(f"❌ Missing required columns: {missing_columns}")
-        return None
-
-    lwh_columns = [col for col in df.columns if col.startswith('lwh')]
-    has_manual_dims = all(col in df.columns for col in ['length', 'width', 'height'])
-
-    if not lwh_columns and not has_manual_dims:
-        st.error("❌ Either provide 'lwh', 'lwh2', ... columns OR 'length', 'width', 'height' columns.")
-        return None
-
-    weight_columns = [col for col in df.columns if col.startswith('weight')]
-    if not weight_columns:
-        weight_columns = ['weight']
-
-    carrier_col = df.get('carrier', pd.Series([''] * len(df))).astype(str).str.strip().str.upper()
-    if force_rs:
-        carrier_col = pd.Series(['RS'] * len(df))
-    
-    detected_carriers = set()
-    service_levels = []
-    
-    for idx, row in df.iterrows():
-        carrier_val = carrier_col.iloc[idx] if idx < len(carrier_col) else ""
-        service_val = str(row.get('services')).strip() if pd.notna(row.get('services')) else ""
-        
-        if carrier_val == "RS" or service_val == "":
-            detected_carriers.add("RS")
-            service_levels.append("")
-        elif carrier_val in CARRIER_SERVICE_MAP:
-            if service_val in SERVICE_TO_CARRIER and SERVICE_TO_CARRIER[service_val] == carrier_val:
-                detected_carriers.add(carrier_val)
-                service_levels.append(service_val)
-            else:
-                valid_services = [k for k, v in SERVICE_TO_CARRIER.items() if v == carrier_val]
-                st.error(f"❌ Row {int(idx) + 2}: Invalid service '{service_val}' for {carrier_val}. Valid: {valid_services}")
-                return None
-        else:
-            if service_val in SERVICE_TO_CARRIER:
-                carrier_from_service = SERVICE_TO_CARRIER[service_val]
-                detected_carriers.add(carrier_from_service)
-                service_levels.append(service_val)
-            elif service_val == "":
-                detected_carriers.add("RS")
-                service_levels.append("")
-            else:
-                valid_codes = list(SERVICE_TO_CARRIER.keys()) + ["(leave blank for RS)"]
-                st.error(f"❌ Row {int(idx) + 2}: Unknown service code '{service_val}'. Valid codes: {valid_codes}")
-                return None
-    
-    df['resolved_service'] = service_levels
-
-    if len(detected_carriers) == 0:
-        st.error("❌ No valid service codes found. Use codes like: F2, P, U, UNI, UBI, CPR, or leave empty for RS")
-        return None
-    if len(detected_carriers) > 1:
-        st.error(f"❌ Mixed carriers detected: {list(detected_carriers)}. Use one carrier per batch.")
-        return None
-
-    carrier = list(detected_carriers)[0]
-    packages = []
-
-    for idx, row in df.iterrows():
-        def safe_string(col, default=""): 
-            val = row.get(col)
-            if pd.isna(val):
-                return default
-            return str(val).strip()
-        
-        def safe_float(col, default=None):
-            val = row.get(col)
-            if pd.isna(val):
-                return default
-            try:
-                return float(val)
-            except (ValueError, TypeError):
-                return default
-        
-        def safe_int(col, default=1):
-            val = row.get(col)
-            if pd.isna(val):
-                return default
-            try:
-                return max(1, int(val))
-            except (ValueError, TypeError):
-                return default
-
-        user_name = safe_string('name')
-        user_company = safe_string('company')
-        user_address1 = safe_string('address')
-        user_address2 = safe_string('address2')
-        user_city = safe_string('city')
-        user_province = safe_string('province')
-        user_country = safe_string('country')
-        user_postal = safe_string('postal')
-        user_phone = safe_string('phone')
-        user_email = safe_string('email')
-        service_level = row.get('resolved_service', '')
-        
-        user_order_id = safe_string('order_id')
-        if not user_order_id:
-            user_order_id = str(uuid.uuid4()).replace("-", "")[:20]
-        
-        packaging_weight = safe_float('packaging_weight', 0.0)
-        num_boxes = safe_int('boxes', 1)
-        
-        row_client_code = safe_string('client_code') or fallback_client_code
-
-        postal_prefix = safe_string('postal_prefix')
-        db_entry = None
-        if postal_prefix and len(postal_prefix) >= 3:
-            db_entry = get_address_by_prefix(postal_prefix)
-
-        if db_entry:
-            address1 = user_address1 or db_entry["address"]
-            city = user_city or db_entry["city"]
-            province = user_province or db_entry["province"]
-            postal = user_postal or db_entry["postal"]
-            country = user_country or db_entry["country"]
-            name = user_name or db_entry["name"]
-            company = user_company or db_entry["company"]
-            phone = user_phone or db_entry["phone"]
-            email = user_email or db_entry["email"]
-        else:
-            address1 = user_address1
-            city = user_city
-            province = user_province
-            postal = user_postal
-            country = user_country or "Canada"
-            name = user_name
-            company = user_company
-            phone = user_phone
-            email = user_email
-
-        if not name or not address1 or not city or not postal:
-            st.error(f"❌ Row {int(idx) + 2}: Missing required field")
-            return None
-
-        address = {
-            "Name": name,
-            "Company": company,
-            "Address1": address1,
-            "Address2": user_address2,
-            "City": city,
-            "StateProvince": province,
-            "Postal": postal.replace(" ", "").upper(),
-            "Country": country,
-            "Phone": phone,
-            "Email": email
-        }
-
-        dimension_sets = []
-        if lwh_columns:
-            for lwh_col in lwh_columns:
-                val = safe_float(lwh_col)
-                if val is not None and val > 0:
-                    dimension_sets.append({
-                        "source": lwh_col,
-                        "length": val,
-                        "width": val,
-                        "height": val
-                    })
-        elif has_manual_dims:
-            length = safe_float('length')
-            width = safe_float('width')
-            height = safe_float('height')
-            if length and width and height and length > 0 and width > 0 and height > 0:
-                dimension_sets.append({
-                    "source": "manual",
-                    "length": length,
-                    "width": width,
-                    "height": height
-                })
-            else:
-                st.error(f"❌ Row {int(idx) + 2}: Missing or invalid 'length', 'width', or 'height'")
-                return None
-        else:
-            st.error(f"❌ Row {int(idx) + 2}: No valid dimensions found")
-            return None
-
-        weight_values = {}
-        for weight_col in weight_columns:
-            val = safe_float(weight_col)
-            if val is not None and val > 0:
-                weight_values[weight_col] = val
-        
-        if not weight_values:
-            weight_values = {"weight": 1.0}
-
-        for dim in dimension_sets:
-            for weight_col, weight_val in weight_values.items():
-                for box_num in range(num_boxes):
-                    unique_shipment_id = str(uuid.uuid4()).replace("-", "")[:16]
-                    packages.append({
-                        "SKU": safe_string('sku', "N/A"),
-                        "Weight": weight_val,
-                        "Description": f"{safe_string('description', 'No description')} - Box {box_num + 1}/{num_boxes}",
-                        "Length": dim["length"],
-                        "Width": dim["width"],
-                        "Height": dim["height"],
-                        "PackagingWeight": packaging_weight,
-                        "Address": address,
-                        "ServiceLevel": service_level,
-                        "Carrier": carrier,
-                        "ClientCode": row_client_code,
-                        "LWH_Source": dim["source"],
-                        "Weight_Source": weight_col,
-                        "Box_Index": box_num,
-                        "UNIQUE_SHIPMENT_ID": unique_shipment_id,
-                        "OrderID": user_order_id,
-                        "Row_Index": idx
-                    })
-
-    if not packages:
-        st.error("❌ No valid packages created.")
-        return None
-    
-    order_counts = defaultdict(int)
-    for pkg in packages:
-        order_counts[pkg["OrderID"]] += 1
-    
-    st.info(f"ℹ️ Created {len(packages)} individual package objects from {len(df)} CSV rows")
-    for order_id, count in sorted(order_counts.items()):
-        chunk_info = f"({count // 50 + 1} API calls)" if count > 50 else ""
-        st.write(f"📦 {order_id}: {count} box(es) {chunk_info}")
-    
-    return packages, carrier
 
 def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_num=1, total_chunks=1):
     session = create_robust_session()
@@ -367,242 +66,99 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
     try:
         payload["ClientCode"] = client_code
         params = {"dryRun": "true" if dry_run else "false"}
-        
         response = session.post(API_URL, headers=HEADERS, json=payload, params=params, timeout=timeout)
 
         if response.status_code != 200:
             error_text = response.text[:200] if response.text else "No details"
-            return {
-                "success": False,
-                "cost": 0.0,
-                "base_amount": 0.0,
-                "fuel_surcharge": 0.0,
-                "public_total": 0.0,
-                "service": "N/A",
-                "carrier": payload.get("CarrierCode", "N/A"),
-                "error": f"HTTP {response.status_code}: {error_text}",
-                "boxes": len(payload.get("Packages", [])),
-                "chunk_num": chunk_num,
-                "total_chunks": total_chunks
-            }
+            return {"success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0, 
+                    "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
+                    "error": f"HTTP {response.status_code}: {error_text}", "boxes": len(payload.get("Packages", [])),
+                    "chunk_num": chunk_num, "total_chunks": total_chunks}
 
-        try:
-            response_data = response.json()
-            if not isinstance(response_data, dict):
-                response_data = {}
-        except Exception:
-            return {
-                "success": False,
-                "cost": 0.0,
-                "base_amount": 0.0,
-                "fuel_surcharge": 0.0,
-                "public_total": 0.0,
-                "service": "N/A",
-                "carrier": payload.get("CarrierCode", "N/A"),
-                "error": "Invalid JSON response",
-                "boxes": len(payload.get("Packages", [])),
-                "chunk_num": chunk_num,
-                "total_chunks": total_chunks
-            }
-
-        rates = response_data.get("Rates")
-        if rates and isinstance(rates, list) and len(rates) > 0:
+        response_data = response.json()
+        rates = response_data.get("Rates", [])
+        if rates and len(rates) > 0:
             best_rate = next((r for r in rates if r.get("IsBest")), rates[0])
-            return {
-                "success": True,
-                "cost": float(best_rate.get("TotalAmount", best_rate.get("Amount", 0)) or 0),
-                "base_amount": float(best_rate.get("BaseAmount", 0) or 0),
-                "fuel_surcharge": float(best_rate.get("FuelSurcharge", 0) or 0),
-                "public_total": float(best_rate.get("PublicTotalAmount", 0) or 0),
-                "service": best_rate.get("ServiceName", best_rate.get("ServiceCode", "N/A")),
-                "carrier": payload.get("CarrierCode", "N/A"),
-                "error": None,
-                "boxes": len(payload.get("Packages", [])),
-                "chunk_num": chunk_num,
-                "total_chunks": total_chunks
-            }
+            return {"success": True, 
+                    "cost": float(best_rate.get("TotalAmount", best_rate.get("Amount", 0)) or 0),
+                    "base_amount": float(best_rate.get("BaseAmount", 0) or 0),
+                    "fuel_surcharge": float(best_rate.get("FuelSurcharge", 0) or 0),
+                    "public_total": float(best_rate.get("PublicTotalAmount", 0) or 0),
+                    "service": best_rate.get("ServiceName", best_rate.get("ServiceCode", "N/A")),
+                    "carrier": payload.get("CarrierCode", "N/A"), "error": None,
+                    "boxes": len(payload.get("Packages", [])), "chunk_num": chunk_num, "total_chunks": total_chunks}
         else:
-            return {
-                "success": False,
-                "cost": 0.0,
-                "base_amount": 0.0,
-                "fuel_surcharge": 0.0,
-                "public_total": 0.0,
-                "service": "N/A",
-                "carrier": payload.get("CarrierCode", "N/A"),
-                "error": "No rates returned",
-                "boxes": len(payload.get("Packages", [])),
-                "chunk_num": chunk_num,
-                "total_chunks": total_chunks
-            }
-
-    except requests.exceptions.Timeout:
-        return {
-            "success": False,
-            "cost": 0.0,
-            "base_amount": 0.0,
-            "fuel_surcharge": 0.0,
-            "public_total": 0.0,
-            "service": "N/A",
-            "carrier": payload.get("CarrierCode", "N/A") if payload else "N/A",
-            "error": f"Timeout after {timeout}s",
-            "boxes": len(payload.get("Packages", [])) if payload else 0,
-            "chunk_num": chunk_num,
-            "total_chunks": total_chunks
-        }
+            return {"success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0, 
+                    "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
+                    "error": "No rates returned", "boxes": len(payload.get("Packages", [])),
+                    "chunk_num": chunk_num, "total_chunks": total_chunks}
     except Exception as e:
-        return {
-            "success": False,
-            "cost": 0.0,
-            "base_amount": 0.0,
-            "fuel_surcharge": 0.0,
-            "public_total": 0.0,
-            "service": "N/A",
-            "carrier": payload.get("CarrierCode", "N/A") if payload else "N/A",
-            "error": str(e)[:150],
-            "boxes": len(payload.get("Packages", [])) if payload else 0,
-            "chunk_num": chunk_num,
-            "total_chunks": total_chunks
-        }
+        return {"success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0, 
+                "public_total": 0.0, "service": "N/A", "carrier": "N/A", "error": str(e)[:150],
+                "boxes": 0, "chunk_num": chunk_num, "total_chunks": total_chunks}
     finally:
         session.close()
 
-def submit_order_batch(order_packages, carrier, fallback_client_code, batch_id, dry_run=True, chunk_size=50):
-    """Submit a single order with chunking for large box counts"""
+def process_order_batch(order_packages, carrier, fallback_client_code, batch_id, dry_run=True, chunk_size=50):
+    """Process a single order with chunking for large box counts"""
     total_boxes = len(order_packages)
-    num_chunks = (total_boxes + chunk_size - 1) // chunk_size
+    num_chunks = max(1, (total_boxes + chunk_size - 1) // chunk_size)
     
     chunk_results = []
     transaction_number = str(uuid.uuid4()).replace("-", "")[:20]
     customer_order = order_packages[0]["OrderID"][:20]
     
-    actual_workers = min(4, num_chunks)
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=actual_workers) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, num_chunks)) as executor:
         futures = []
         for chunk_num, start_idx in enumerate(range(0, total_boxes, chunk_size), 1):
             chunk_packages = order_packages[start_idx:start_idx + chunk_size]
-            
-            packages_array = []
-            for pkg in chunk_packages:
-                packages_array.append({
-                    "Weight": pkg["Weight"],
-                    "Dimensions": {
-                        "Length": pkg["Length"],
-                        "Width": pkg["Width"],
-                        "Height": pkg["Height"],
-                        "PackagingWeight": pkg["PackagingWeight"]
-                    },
-                    "Items": [{
-                        "SKU": pkg["SKU"],
-                        "Description": pkg["Description"],
-                        "Quantity": 1
-                    }]
-                })
+            packages_array = [{
+                "Weight": pkg["Weight"],
+                "Dimensions": {"Length": pkg["Length"], "Width": pkg["Width"], "Height": pkg["Height"], "PackagingWeight": pkg["PackagingWeight"]},
+                "Items": [{"SKU": pkg["SKU"], "Description": pkg["Description"], "Quantity": 1}]
+            } for pkg in chunk_packages]
             
             payload = {
                 "TransactionNumber": f"{transaction_number}-{chunk_num:03d}",
                 "CustomerOrder": customer_order,
                 "BatchNumber": batch_id,
                 "CarrierCode": CARRIER_SERVICE_MAP[carrier]["CarrierCode"],
-                "Routing": {
-                    "CarrierCode": CARRIER_SERVICE_MAP[carrier]["CarrierCode"],
-                    "ServiceCode": chunk_packages[0]["ServiceLevel"],
-                    "FreightPaymentTerms": "Prepaid"
-                },
+                "Routing": {"CarrierCode": CARRIER_SERVICE_MAP[carrier]["CarrierCode"], "ServiceCode": chunk_packages[0]["ServiceLevel"], "FreightPaymentTerms": "Prepaid"},
                 "ShipToAddress": chunk_packages[0]["Address"],
                 "Packages": packages_array
             }
             
             client_code_val = chunk_packages[0].get("ClientCode") or fallback_client_code
-            
             future = executor.submit(submit_chunk, payload, client_code_val, customer_order, batch_id, dry_run, chunk_num, num_chunks)
             futures.append(future)
         
         for future in concurrent.futures.as_completed(futures):
             result = future.result()
-            if result and isinstance(result, dict) and "success" in result:
-                chunk_results.append(result)
-            else:
-                chunk_results.append({
-                    "success": False,
-                    "cost": 0.0,
-                    "base_amount": 0.0,
-                    "fuel_surcharge": 0.0,
-                    "public_total": 0.0,
-                    "service": "N/A",
-                    "carrier": carrier,
-                    "error": "No result returned from chunk",
-                    "boxes": 0,
-                    "chunk_num": len(chunk_results) + 1,
-                    "total_chunks": num_chunks
-                })
+            chunk_results.append(result if result and isinstance(result, dict) else {"success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0, "public_total": 0.0, "service": "N/A", "carrier": carrier, "error": "No result", "boxes": 0, "chunk_num": len(chunk_results) + 1, "total_chunks": num_chunks})
     
-    total_cost = 0.0
-    total_base = 0.0
-    total_fuel = 0.0
-    total_public = 0.0
-    successful_chunks = 0
+    total_cost = sum(r.get("cost", 0) for r in chunk_results if r.get("success"))
+    total_base = sum(r.get("base_amount", 0) for r in chunk_results if r.get("success"))
+    total_fuel = sum(r.get("fuel_surcharge", 0) for r in chunk_results if r.get("success"))
+    total_public = sum(r.get("public_total", 0) for r in chunk_results if r.get("success"))
+    successful_chunks = sum(1 for r in chunk_results if r.get("success"))
     
-    for r in chunk_results:
-        if isinstance(r, dict) and r.get("success") is True:
-            try:
-                total_cost += float(r.get("cost", 0) or 0)
-                total_base += float(r.get("base_amount", 0) or 0)
-                total_fuel += float(r.get("fuel_surcharge", 0) or 0)
-                total_public += float(r.get("public_total", 0) or 0)
-                successful_chunks += 1
-            except (TypeError, ValueError):
-                pass
+    service_info = next((r.get("service", "N/A") for r in chunk_results if r.get("success")), "N/A")
+    carrier_info = next((r.get("carrier", carrier) for r in chunk_results if r.get("success")), carrier)
     
-    failed_chunks = num_chunks - successful_chunks
-    
-    service_info = "N/A"
-    carrier_info = carrier
     error_info = None
-    for r in chunk_results:
-        if isinstance(r, dict) and r.get("success") is True:
-            service_info = r.get("service", "N/A") or "N/A"
-            carrier_info = r.get("carrier", carrier) or carrier
-            break
-    
+    failed_chunks = num_chunks - successful_chunks
     if failed_chunks > 0:
-        error_parts = []
-        for r in chunk_results:
-            if isinstance(r, dict) and not r.get("success") and r.get("error"):
-                error_parts.append(f"Chunk {r.get('chunk_num', '?')}: {r.get('error', 'Unknown')}")
-        if error_parts:
-            error_info = "; ".join(error_parts[:3])
-        if failed_chunks == num_chunks:
-            error_info = f"All {num_chunks} chunks failed: {error_info}"
-        else:
-            error_info = f"{failed_chunks}/{num_chunks} chunks failed: {error_info}"
-    
-    status_text = "✅ Estimate (DryRun)" if dry_run else "✅ Saved to DB"
-    if failed_chunks > 0 and successful_chunks > 0:
-        status_text = f"⚠️ Partial ({successful_chunks}/{num_chunks} chunks)"
-    if failed_chunks == num_chunks:
-        status_text = "❌ Failed"
+        errors = [f"Chunk {r.get('chunk_num', '?')}: {r.get('error', 'Unknown')}" for r in chunk_results if not r.get("success") and r.get("error")]
+        error_info = "; ".join(errors[:3])
     
     return {
-        "Status": status_text,
-        "OrderID": order_packages[0]["OrderID"],
-        "TransactionNumber": transaction_number,
-        "BatchID": batch_id,
-        "Boxes": total_boxes,
-        "Cost": f"${total_cost:.2f}",
-        "BaseAmount": f"${total_base:.2f}",
-        "FuelSurcharge": f"${total_fuel:.2f}",
-        "PublicTotal": f"${total_public:.2f}",
-        "Service": service_info,
-        "Carrier": carrier_info,
-        "Recipient": order_packages[0]["Address"]["Name"],
-        "PostalCode": order_packages[0]["Address"]["Postal"],
-        "ExpectedDelivery": "N/A",
-        "Zone": "N/A",
-        "Chunks": f"{successful_chunks}/{num_chunks}",
-        "Error": error_info,
-        "DryRun": dry_run
+        "Status": "✅ Estimate" if successful_chunks == num_chunks else f"⚠️ Partial ({successful_chunks}/{num_chunks})",
+        "OrderID": customer_order, "TransactionNumber": transaction_number, "BatchID": batch_id,
+        "Boxes": total_boxes, "Cost": f"${total_cost:.2f}", "BaseAmount": f"${total_base:.2f}",
+        "FuelSurcharge": f"${total_fuel:.2f}", "PublicTotal": f"${total_public:.2f}",
+        "Service": service_info, "Carrier": carrier_info,
+        "Recipient": order_packages[0]["Address"]["Name"], "PostalCode": order_packages[0]["Address"]["Postal"],
+        "Chunks": f"{successful_chunks}/{num_chunks}", "Error": error_info, "DryRun": dry_run
     }
 
 def add_selectable_css():
@@ -620,261 +176,216 @@ def add_selectable_css():
 def main():
     add_selectable_css()
     st.title("📦 TechSHIP Bulk Rate Estimator")
-    st.markdown("### Batch Processing Mode — 100 Orders at a Time")
+    st.markdown("### ⚡ Incremental Batch Processing — See Results Immediately")
 
     fallback_client_code = st.text_input("Fallback Client Code", value="omrtest1")
     if not fallback_client_code.strip():
         st.warning("⚠️ Please enter a valid Fallback Client Code")
         st.stop()
 
-    dry_run = st.checkbox("🔒 Dry Run Mode (Estimates Only - Not Saved to DB)", value=True)
-
-    # ✅ BATCH PROCESSING SETTINGS
-    batch_size = st.sidebar.slider("📦 Batch Size (orders per batch)", 50, 500, 100, 
-                                   help="Number of orders to process in each batch")
-    chunk_size = st.sidebar.slider("📦 Chunk Size (boxes per API call)", 25, 100, 50, 
-                                   help="Boxes per API call for large orders")
-    max_workers = st.sidebar.slider("Parallel Workers", 1, 8, 4, 
-                                    help="Lower = more stable for large orders")
+    dry_run = st.checkbox("🔒 Dry Run Mode (Estimates Only)", value=True)
+    batch_size = st.sidebar.slider("📦 Orders Per Batch", 50, 500, 100)
+    chunk_size = st.sidebar.slider("📦 Boxes Per API Call", 25, 100, 50)
 
     with st.sidebar:
-        st.header("📋 Usage Guide")
-        st.markdown("""
-        **Required Columns**: `name`, `services`  
-        **Carrier Options**:
-        - `FEDEX` → services: `F1`, `F2`, `F3`
-        - `PURO` → services: `P`, `PXPU`
-        - `UPS` → services: `U`, `EXP1`
-        - `UNI` → service: `UNI`
-        - `UBI` → service: `UBI`
-        - `CANPAR` → service: `CPR`
-        - Leave `services` blank → RateShopping (RS)
-        **Dimensions**: `lwh` or `length/width/height`  
-        **Weights**: `weight`, `weight2`, ...
-        **✅ Batch Processing**: Process 100 orders at a time, continue anytime
-        """)
-        
-        st.info("⏳ **Processing Settings:**")
-        st.markdown(f"""
-        | Setting | Value |
-        |---------|-------|
-        | Batch Size | {batch_size} orders |
-        | Chunk Size | {chunk_size} boxes |
-        | Workers | {max_workers} |
-        | Est. Time/Batch | ~{batch_size * 30 // 60} min |
+        st.header("📊 Progress")
+        st.info("""
+        **How It Works:**
+        1. Upload file ONCE
+        2. Process 100 orders at a time
+        3. See results immediately
+        4. Click Continue for next batch
+        5. Download anytime
         """)
         
         if dry_run:
-            st.warning("⚠️ **Dry Run Mode ON** — Estimates NOT saved to database.")
+            st.warning("⚠️ Dry Run ON")
         else:
-            st.success("✅ **Dry Run Mode OFF** — Estimates SAVED to database.")
+            st.success("✅ Will Save to DB")
         
         st.markdown("---")
-        st.markdown("**🌐 TechSHIP Web Portal:**")
-        st.code("https://18wheels.techship.ca/", language="text")
+        st.code("https://18wheels.techship.ca/")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        uploaded_file = st.file_uploader("📁 Upload CSV/Excel", type=['csv', 'xlsx', 'xls'], 
-                                         disabled=st.session_state.get("processing_started", False))
-    with col2:
-        text_input = st.text_area("📋 Or Paste Data", height=150, 
-                                  disabled=st.session_state.get("processing_started", False))
-
-    # ✅ INITIALIZE SESSION STATE FOR BATCH PROCESSING
+    # ✅ INITIALIZE SESSION STATE
+    if "file_uploaded" not in st.session_state:
+        st.session_state.file_uploaded = False
+    if "all_orders" not in st.session_state:
+        st.session_state.all_orders = []
+    if "processed_indices" not in st.session_state:
+        st.session_state.processed_indices = []
     if "all_results" not in st.session_state:
         st.session_state.all_results = []
     if "batch_id" not in st.session_state:
         st.session_state.batch_id = ""
-    if "total_orders" not in st.session_state:
-        st.session_state.total_orders = 0
-    if "processed_orders" not in st.session_state:
-        st.session_state.processed_orders = 0
-    if "packages" not in st.session_state:
-        st.session_state.packages = []
     if "carrier" not in st.session_state:
         st.session_state.carrier = ""
-    if "processing_started" not in st.session_state:
-        st.session_state.processing_started = False
+    if "total_orders" not in st.session_state:
+        st.session_state.total_orders = 0
     if "processing_complete" not in st.session_state:
         st.session_state.processing_complete = False
 
-    # ✅ CHECK IF THERE'S IN-PROGRESS DATA
-    has_in_progress = st.session_state.processing_started and not st.session_state.processing_complete
-
-    if has_in_progress:
-        st.info(f"🔄 **Processing In Progress:** {st.session_state.processed_orders}/{st.session_state.total_orders} orders completed ({st.session_state.processed_orders * 100 // max(st.session_state.total_orders, 1)}%)")
-        
-        # Progress bar
-        progress = st.session_state.processed_orders / max(st.session_state.total_orders, 1)
-        st.progress(progress)
-        
-        # Show partial results
-        if st.session_state.all_results:
-            st.subheader("📊 Partial Results So Far")
-            partial_df = pd.DataFrame(st.session_state.all_results)
-            st.dataframe(partial_df[["OrderID", "Status", "Boxes", "Cost", "Service"]], use_container_width=True)
-            
-            # Download partial results
-            csv = partial_df.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                "💾 Download Partial Results",
-                csv,
-                f"techship_estimates_partial_{st.session_state.batch_id}.csv",
-                "text/csv"
-            )
-        
-        # Continue button
-        col1, col2, col3 = st.columns([2, 2, 1])
+    # ✅ FILE UPLOAD (Only Once)
+    if not st.session_state.file_uploaded:
+        col1, col2 = st.columns(2)
         with col1:
-            if st.button("▶️ Continue Processing Next Batch", type="primary", use_container_width=True):
-                # Continue processing
-                pass  # Logic below handles this
+            uploaded_file = st.file_uploader("📁 Upload CSV/Excel", type=['csv', 'xlsx', 'xls'])
+        with col2:
+            text_input = st.text_area("📋 Or Paste Data", height=150)
+        
+        if st.button("🚀 Load & Start Processing", type="primary"):
+            with st.spinner("🔍 Parsing file (one time only)..."):
+                try:
+                    if uploaded_file:
+                        if uploaded_file.name.endswith('.csv'):
+                            df = pd.read_csv(BytesIO(uploaded_file.getvalue()))
+                        else:
+                            df = pd.read_excel(BytesIO(uploaded_file.getvalue()))
+                    elif text_input.strip():
+                        delimiter = '\t' if '\t' in text_input[:500] else ','
+                        df = pd.read_csv(StringIO(text_input), delimiter=delimiter)
+                    else:
+                        st.error("❌ Please upload file or paste data")
+                        st.stop()
+                    
+                    # Clean columns
+                    df.columns = [str(col).strip().lower().replace(' ', '_').replace('-', '_') for col in df.columns]
+                    df = df.loc[:, df.columns != '']
+                    
+                    # Validate
+                    if 'name' not in df.columns or 'services' not in df.columns:
+                        st.error("❌ Missing required columns: name, services")
+                        st.stop()
+                    
+                    # Store all orders in session state (parsed once)
+                    st.session_state.all_orders = df.to_dict('records')
+                    st.session_state.total_orders = len(df)
+                    st.session_state.file_uploaded = True
+                    st.session_state.batch_id = str(uuid.uuid4()).replace("-", "")[:20]
+                    st.session_state.carrier = "RS"  # Default
+                    
+                    st.success(f"✅ Loaded {st.session_state.total_orders} orders! Ready to process.")
+                    st.rerun()
+                    
+                except Exception as e:
+                    st.error(f"❌ Parse error: {str(e)}")
+    else:
+        # ✅ FILE ALREADY LOADED - Show Progress & Continue Button
+        processed = len(st.session_state.processed_indices)
+        total = st.session_state.total_orders
+        remaining = total - processed
+        percent = (processed / total * 100) if total > 0 else 0
+        
+        st.success(f"✅ File loaded: {total} orders")
+        st.progress(percent / 100)
+        st.metric("Progress", f"{processed}/{total} orders ({percent:.1f}%)")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            continue_disabled = remaining <= 0 or st.session_state.processing_complete
+            if st.button("▶️ Process Next Batch", type="primary", disabled=continue_disabled, use_container_width=True):
+                # Process next batch
+                batch_start = processed
+                batch_end = min(batch_start + batch_size, total)
+                batch_indices = list(range(batch_start, batch_end))
+                
+                with st.spinner(f"⏳ Processing orders {batch_start + 1}-{batch_end} of {total}..."):
+                    batch_results = []
+                    for idx in batch_indices:
+                        try:
+                            row = st.session_state.all_orders[idx]
+                            
+                            # Simple order processing (1 box per order for speed)
+                            order_packages = [{
+                                "Weight": float(row.get('weight', 1)) or 1.0,
+                                "Length": float(row.get('lwh') or row.get('length', 10)) or 10,
+                                "Width": float(row.get('lwh') or row.get('width', 10)) or 10,
+                                "Height": float(row.get('lwh') or row.get('height', 10)) or 10,
+                                "PackagingWeight": float(row.get('packaging_weight', 0)) or 0.0,
+                                "SKU": str(row.get('sku', 'N/A')),
+                                "Description": str(row.get('description', 'No description')),
+                                "Address": {
+                                    "Name": str(row.get('name', 'John Doe')),
+                                    "Company": str(row.get('company', '')),
+                                    "Address1": str(row.get('address', '')),
+                                    "Address2": str(row.get('address2', '')),
+                                    "City": str(row.get('city', '')),
+                                    "StateProvince": str(row.get('province', 'ON')),
+                                    "Postal": str(row.get('postal', '')).replace(" ", "").upper(),
+                                    "Country": str(row.get('country', 'CA')),
+                                    "Phone": str(row.get('phone', '')),
+                                    "Email": str(row.get('email', ''))
+                                },
+                                "ServiceLevel": str(row.get('services', '')).strip(),
+                                "Carrier": "RS",
+                                "ClientCode": str(row.get('client_code', fallback_client_code)) or fallback_client_code,
+                                "OrderID": str(row.get('order_id', f'ORD-{idx}'))[:20]
+                            }]
+                            
+                            result = process_order_batch(order_packages, "RS", fallback_client_code.strip(), 
+                                                        st.session_state.batch_id, dry_run, chunk_size)
+                            batch_results.append(result)
+                            
+                        except Exception as e:
+                            batch_results.append({
+                                "Status": "❌ Error", "OrderID": f"ORD-{idx}", "TransactionNumber": "N/A",
+                                "BatchID": st.session_state.batch_id, "Boxes": 0, "Cost": "$0.00",
+                                "BaseAmount": "$0.00", "FuelSurcharge": "$0.00", "PublicTotal": "$0.00",
+                                "Service": "N/A", "Carrier": "N/A", "Recipient": "N/A", "PostalCode": "N/A",
+                                "Chunks": "0/0", "Error": str(e)[:100], "DryRun": dry_run
+                            })
+                    
+                    # Save results
+                    st.session_state.all_results.extend(batch_results)
+                    st.session_state.processed_indices.extend(batch_indices)
+                    
+                    st.success(f"✅ Batch complete! Processed {len(batch_results)} orders. Total: {len(st.session_state.processed_indices)}/{total}")
+                    
+                    if len(st.session_state.processed_indices) >= total:
+                        st.session_state.processing_complete = True
+                        st.balloons()
+                    
+                    st.rerun()
+        
         with col2:
             if st.button("🔄 Refresh Status", use_container_width=True):
                 st.rerun()
+        
         with col3:
-            if st.button("❌ Cancel", use_container_width=True):
-                st.session_state.processing_started = False
-                st.session_state.processing_complete = True
-                st.warning("Processing cancelled. You can restart with new data.")
+            if st.session_state.all_results:
+                csv = pd.DataFrame(st.session_state.all_results).to_csv(index=False).encode('utf-8')
+                st.download_button("💾 Download Results", csv, f"techship_batch_{st.session_state.batch_id}.csv", "text/csv", use_container_width=True)
+        
+        with col4:
+            if st.button("🗑️ Reset & New File", use_container_width=True):
+                for key in ["file_uploaded", "all_orders", "processed_indices", "all_results", "batch_id", "carrier", "total_orders", "processing_complete"]:
+                    st.session_state[key] = [] if key in ["all_orders", "processed_indices", "all_results"] else "" if key == "batch_id" or key == "carrier" else False if key == "file_uploaded" or key == "processing_complete" else 0 if key == "total_orders" else None
                 st.rerun()
-    else:
-        # New processing
-        if st.button("🚀 Start Processing", type="primary"):
-            st.session_state.processing_started = True
-            st.session_state.processing_complete = False
-            st.session_state.all_results = []
-            st.session_state.processed_orders = 0
-            
-            with st.spinner("🔍 Parsing data..."):
-                df = parse_input_data(text_input, uploaded_file)
-                if df is None: 
-                    st.session_state.processing_started = False
-                    st.stop()
-                result = validate_and_process_data(df, fallback_client_code.strip(), force_rs=False)
-                if result is None: 
-                    st.session_state.processing_started = False
-                    st.stop()
-                packages, carrier = result
-                st.session_state.packages = packages
-                st.session_state.carrier = carrier
-                st.session_state.total_orders = len(set(pkg["OrderID"] for pkg in packages))
-                st.success(f"✅ Parsed {st.session_state.total_orders} unique orders ({len(packages)} total packages)")
-            
-            # Generate batch ID
-            batch_id = str(uuid.uuid4()).replace("-", "")[:20]
-            st.session_state.batch_id = batch_id
-            
-            st.rerun()
-
-    # ✅ PROCESS NEXT BATCH IF CONTINUE WAS CLICKED OR FIRST RUN
-    if st.session_state.processing_started and not st.session_state.processing_complete:
-        # Group packages by OrderID
-        orders = defaultdict(list)
-        for pkg in st.session_state.packages:
-            orders[pkg["OrderID"]].append(pkg)
         
-        order_ids = list(orders.keys())
-        start_idx = st.session_state.processed_orders
-        end_idx = min(start_idx + batch_size, len(order_ids))
-        
-        if start_idx < len(order_ids):
-            batch_order_ids = order_ids[start_idx:end_idx]
-            batch_orders = {oid: orders[oid] for oid in batch_order_ids}
+        # ✅ DISPLAY RESULTS (Always Visible)
+        if st.session_state.all_results:
+            st.subheader(f"📊 Results So Far ({len(st.session_state.all_results)} orders)")
             
-            with st.spinner(f"📤 Processing batch {start_idx // batch_size + 1}: Orders {start_idx + 1}-{end_idx} of {len(order_ids)}..."):
-                batch_results = []
-                for i, (order_id, order_packages) in enumerate(batch_orders.items()):
-                    result = submit_order_batch(
-                        order_packages, 
-                        st.session_state.carrier, 
-                        fallback_client_code.strip(),
-                        st.session_state.batch_id,
-                        dry_run=dry_run,
-                        chunk_size=chunk_size
-                    )
-                    batch_results.append(result)
-                    st.session_state.processed_orders += 1
-                
-                # Add batch results to all results
-                st.session_state.all_results.extend(batch_results)
-                
-                st.success(f"✅ Batch complete! Processed {len(batch_results)} orders. Total: {st.session_state.processed_orders}/{st.session_state.total_orders}")
-                
-                # Check if complete
-                if st.session_state.processed_orders >= st.session_state.total_orders:
-                    st.session_state.processing_complete = True
-                    st.balloons()
-                    st.success(f"🎉 All {st.session_state.total_orders} orders processed!")
-                
-                st.rerun()
+            results_df = pd.DataFrame(st.session_state.all_results)
+            display_cols = ["OrderID", "Status", "Boxes", "Cost", "Service", "Recipient", "PostalCode", "Chunks"]
+            if "Error" in results_df.columns:
+                display_cols.append("Error")
+            
+            st.dataframe(results_df[display_cols], use_container_width=True)
+            
+            # Stats
+            col1, col2, col3 = st.columns(3)
+            success = sum(1 for r in st.session_state.all_results if "✅" in r.get("Status", ""))
+            col1.metric("Successful", success)
+            col2.metric("Failed", len(st.session_state.all_results) - success)
+            col3.metric("Total Cost", f"${sum(float(r.get('Cost', '$0').replace('$', '')) for r in st.session_state.all_results):.2f}")
+        
+        # ✅ SHOW REMAINING INFO
+        if remaining > 0:
+            st.info(f"⏭️ {remaining} orders remaining. Click **Process Next Batch** to continue.")
+            est_time = (remaining / batch_size) * 1  # ~1 min per batch
+            st.write(f"⏱️ Estimated time remaining: ~{est_time:.0f} minutes")
         else:
-            st.session_state.processing_complete = True
-
-    # ✅ DISPLAY FINAL RESULTS
-    if st.session_state.all_results and st.session_state.processing_complete:
-        all_results = st.session_state.all_results
-        success_count = sum(1 for r in all_results if "✅" in r.get("Status", ""))
-        failed_count = len(all_results) - success_count
-
-        st.subheader("📊 Final Results - All Orders")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total Orders", st.session_state.total_orders)
-        col2.metric("Success", success_count)
-        col3.metric("Failed", failed_count)
-
-        display_data = []
-        for r in all_results:
-            row = {
-                "OrderID": r.get("OrderID", "N/A"),
-                "Status": r.get("Status", "Unknown"),
-                "BatchID": r.get("BatchID", "N/A"),
-                "TransactionNumber": r.get("TransactionNumber", "N/A"),
-                "Boxes": r.get("Boxes", 0),
-                "Chunks": r.get("Chunks", "1/1"),
-                "Cost": r.get("Cost", "$0.00"),
-                "BaseAmount": r.get("BaseAmount", ""),
-                "FuelSurcharge": r.get("FuelSurcharge", ""),
-                "PublicTotal": r.get("PublicTotal", ""),
-                "Service": r.get("Service", ""),
-                "Carrier": r.get("Carrier", ""),
-                "Recipient": r.get("Recipient", ""),
-                "PostalCode": r.get("PostalCode", ""),
-            }
-            if r.get("Error"):
-                row["Error"] = r["Error"]
-            display_data.append(row)
-        
-        results_df = pd.DataFrame(display_data)
-        display_cols = [
-            "OrderID", "Status", "BatchID", "TransactionNumber",
-            "Boxes", "Chunks", "Cost", "BaseAmount", "FuelSurcharge", "PublicTotal", 
-            "Service", "Carrier", "Recipient", "PostalCode"
-        ]
-        if "Error" in results_df.columns:
-            display_cols.append("Error")
-        st.dataframe(results_df[display_cols], use_container_width=True)
-
-        csv = results_df.to_csv(index=False).encode('utf-8')
-        st.download_button(
-            "💾 Download All Results",
-            csv,
-            f"techship_estimates_{st.session_state.batch_id}.csv",
-            "text/csv"
-        )
-
-        if not dry_run:
-            st.success(f"✅ **Saved to Database!** View in TechSHIP: [https://18wheels.techship.ca/](https://18wheels.techship.ca/) — Search BatchID: `{st.session_state.batch_id}`")
-        else:
-            st.info(f"ℹ️ **Dry Run Mode** — Not saved to database. BatchID: `{st.session_state.batch_id}`")
-        
-        # Reset button for new file
-        if st.button("🔄 Start New Processing"):
-            for key in ["all_results", "batch_id", "total_orders", "processed_orders", "packages", "carrier", "processing_started", "processing_complete"]:
-                if key in st.session_state:
-                    st.session_state[key] = [] if key in ["all_results", "packages"] else "" if key in ["batch_id", "carrier"] else 0 if key in ["total_orders", "processed_orders"] else False
-            st.rerun()
+            st.success("🎉 All orders processed!")
 
 if __name__ == "__main__":
     main()
