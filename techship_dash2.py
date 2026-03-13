@@ -93,7 +93,6 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
         clean_columns.append(cleaned)
     df.columns = clean_columns
 
-    # ✅ Drop any empty column names (caused by trailing commas in CSV)
     df = df.loc[:, df.columns != '']
 
     column_mapping = {
@@ -186,7 +185,6 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
     packages = []
 
     for idx, row in df.iterrows():
-        # ✅ FIXED: Use .get() to avoid KeyError on missing columns
         def safe_string(col, default=""): 
             val = row.get(col)
             if pd.isna(val):
@@ -228,14 +226,10 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
             user_order_id = str(uuid.uuid4()).replace("-", "")[:20]
         
         packaging_weight = safe_float('packaging_weight', 0.0)
-        
-        # ✅ FIX: Properly handle 'boxes' column - default to 1 if empty/invalid
         num_boxes = safe_int('boxes', 1)
         
-        # Safety cap to prevent API overload from typos (e.g., 2000 instead of 2)
-        if num_boxes > 100:
-            st.warning(f"⚠️ Row {int(idx) + 2}: Large box count ({num_boxes}) detected. Limiting to 100 for API stability.")
-            num_boxes = 100
+        if num_boxes > 50:
+            st.warning(f"⚠️ Row {int(idx) + 2}: Large box count ({num_boxes}). Consider splitting into multiple orders.")
         
         row_client_code = safe_string('client_code') or fallback_client_code
 
@@ -320,40 +314,44 @@ def validate_and_process_data(df, fallback_client_code, force_rs=False):
         if not weight_values:
             weight_values = {"weight": 1.0}
 
-        # ✅ FIX: Create ONE package per order with TOTAL weight (weight × boxes)
-        # This ensures the API prices the entire shipment, not just one box
+        # ✅ FIX: Create INDIVIDUAL package object for EACH box
         for dim in dimension_sets:
             for weight_col, weight_val in weight_values.items():
-                # Calculate total weight for all boxes
-                total_weight = weight_val * num_boxes
-                total_packaging = packaging_weight * num_boxes
-                
-                unique_shipment_id = str(uuid.uuid4()).replace("-", "")[:16]
-                packages.append({
-                    "SKU": safe_string('sku', "N/A"),
-                    "Weight": total_weight,  # ✅ Total weight = per-box weight × num_boxes
-                    "Description": safe_string('description', "No description"),
-                    "Length": dim["length"],
-                    "Width": dim["width"],
-                    "Height": dim["height"],
-                    "PackagingWeight": total_packaging,  # ✅ Total packaging weight
-                    "Address": address,
-                    "ServiceLevel": service_level,
-                    "Carrier": carrier,
-                    "ClientCode": row_client_code,
-                    "LWH_Source": dim["source"],
-                    "Weight_Source": weight_col,
-                    "NumBoxes": num_boxes,  # ✅ Track original box count for display
-                    "UNIQUE_SHIPMENT_ID": unique_shipment_id,
-                    "OrderID": user_order_id,
-                    "Row_Index": idx
-                })
+                for box_num in range(num_boxes):
+                    unique_shipment_id = str(uuid.uuid4()).replace("-", "")[:16]
+                    packages.append({
+                        "SKU": safe_string('sku', "N/A"),
+                        "Weight": weight_val,  # ✅ Individual box weight (NOT multiplied)
+                        "Description": f"{safe_string('description', 'No description')} - Box {box_num + 1}",
+                        "Length": dim["length"],
+                        "Width": dim["width"],
+                        "Height": dim["height"],
+                        "PackagingWeight": packaging_weight,
+                        "Address": address,
+                        "ServiceLevel": service_level,
+                        "Carrier": carrier,
+                        "ClientCode": row_client_code,
+                        "LWH_Source": dim["source"],
+                        "Weight_Source": weight_col,
+                        "Box_Index": box_num,
+                        "UNIQUE_SHIPMENT_ID": unique_shipment_id,
+                        "OrderID": user_order_id,
+                        "Row_Index": idx
+                    })
 
     if not packages:
         st.error("❌ No valid packages created.")
         return None
     
-    st.info(f"ℹ️ Created {len(packages)} shipment estimates from {len(df)} CSV rows")
+    # Group by OrderID to show how many packages per order
+    order_counts = defaultdict(int)
+    for pkg in packages:
+        order_counts[pkg["OrderID"]] += 1
+    
+    st.info(f"ℹ️ Created {len(packages)} individual package objects from {len(df)} CSV rows")
+    for order_id, count in sorted(order_counts.items()):
+        st.write(f"📦 {order_id}: {count} box(es)")
+    
     return packages, carrier
 
 def submit_single_shipment(payload, client_code, order_id, batch_id, dry_run=True, num_boxes=1):
@@ -483,27 +481,24 @@ def submit_single_shipment(payload, client_code, order_id, batch_id, dry_run=Tru
         session.close()
 
 def submit_all_shipments(packages, carrier, fallback_client_code, batch_id, dry_run=True, max_workers=4):
-    """Submit ALL packages and return results - NO batching"""
+    """Submit packages grouped by OrderID - each order gets ALL its boxes in one API call"""
     actual_workers = min(max_workers, 8)
     
-    payloads = []
+    # ✅ Group packages by OrderID
+    orders = defaultdict(list)
     for pkg in packages:
-        customer_order = pkg.get("OrderID", str(uuid.uuid4()).replace("-", "")[:20])[:20]
+        orders[pkg["OrderID"]].append(pkg)
+    
+    payloads = []
+    for order_id, order_packages in orders.items():
+        customer_order = order_id[:20]
         transaction_number = str(uuid.uuid4()).replace("-", "")[:20]
         
-        payload = {
-            "TransactionNumber": transaction_number,
-            "CustomerOrder": customer_order,
-            "BatchNumber": batch_id,
-            "CarrierCode": CARRIER_SERVICE_MAP[carrier]["CarrierCode"],
-            "Routing": {
-                "CarrierCode": CARRIER_SERVICE_MAP[carrier]["CarrierCode"],
-                "ServiceCode": pkg["ServiceLevel"],
-                "FreightPaymentTerms": "Prepaid"
-            },
-            "ShipToAddress": pkg["Address"],
-            "Packages": [{
-                "Weight": pkg["Weight"],
+        # ✅ Build Packages array with ALL individual boxes for this order
+        packages_array = []
+        for pkg in order_packages:
+            packages_array.append({
+                "Weight": pkg["Weight"],  # Individual box weight
                 "Dimensions": {
                     "Length": pkg["Length"],
                     "Width": pkg["Width"],
@@ -515,11 +510,24 @@ def submit_all_shipments(packages, carrier, fallback_client_code, batch_id, dry_
                     "Description": pkg["Description"],
                     "Quantity": 1
                 }]
-            }]
+            })
+        
+        payload = {
+            "TransactionNumber": transaction_number,
+            "CustomerOrder": customer_order,
+            "BatchNumber": batch_id,
+            "CarrierCode": CARRIER_SERVICE_MAP[carrier]["CarrierCode"],
+            "Routing": {
+                "CarrierCode": CARRIER_SERVICE_MAP[carrier]["CarrierCode"],
+                "ServiceCode": order_packages[0]["ServiceLevel"],
+                "FreightPaymentTerms": "Prepaid"
+            },
+            "ShipToAddress": order_packages[0]["Address"],
+            "Packages": packages_array  # ✅ Array of ALL individual boxes
         }
         
-        client_code_val = pkg.get("ClientCode") or fallback_client_code
-        num_boxes = pkg.get("NumBoxes", 1)
+        client_code_val = order_packages[0].get("ClientCode") or fallback_client_code
+        num_boxes = len(order_packages)
         
         payloads.append((payload, client_code_val, customer_order, batch_id, num_boxes))
     
@@ -528,7 +536,6 @@ def submit_all_shipments(packages, carrier, fallback_client_code, batch_id, dry_
         futures = [executor.submit(submit_single_shipment, payload, client_code_val, order_id, bid, dry_run, num_boxes) 
                    for payload, client_code_val, order_id, bid, num_boxes in payloads]
         
-        # Show progress
         progress_bar = st.progress(0)
         for i, future in enumerate(concurrent.futures.as_completed(futures)):
             results.append(future.result())
@@ -536,7 +543,6 @@ def submit_all_shipments(packages, carrier, fallback_client_code, batch_id, dry_
         
         progress_bar.empty()
     
-    # Sort by OrderID
     results.sort(key=lambda x: x.get("OrderID", ""))
     return results
 
@@ -555,7 +561,7 @@ def add_selectable_css():
 def main():
     add_selectable_css()
     st.title("📦 TechSHIP Bulk Rate Estimator")
-    st.markdown("### All Orders Displayed - Boxes Pricing Fixed")
+    st.markdown("### Accurate Multi-Box Pricing - Matches TechSHIP Website")
 
     fallback_client_code = st.text_input("Fallback Client Code", value="omrtest1")
     if not fallback_client_code.strip():
@@ -582,7 +588,7 @@ def main():
         - Leave `services` blank → RateShopping (RS)
         **Dimensions**: `lwh` or `length/width/height`  
         **Weights**: `weight`, `weight2`, ...
-        **✅ Boxes**: `boxes` column now properly multiplies weight for accurate pricing
+        **✅ Boxes**: Each box is sent as individual package for accurate pricing
         """)
         
         if dry_run:
@@ -593,7 +599,6 @@ def main():
         st.markdown("---")
         st.markdown("**🌐 TechSHIP Web Portal:**")
         st.code("https://18wheels.techship.ca/", language="text")
-        st.markdown("Search by `BatchID` or `TransactionNumber` from results below.")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -621,8 +626,8 @@ def main():
                 st.session_state.processing_done = True
                 st.stop()
             packages, carrier = result
-            st.session_state.total_orders = len(packages)
-            st.success(f"✅ Parsed {len(packages)} orders for {carrier}")
+            st.session_state.total_orders = len(set(pkg["OrderID"] for pkg in packages))
+            st.success(f"✅ Parsed {st.session_state.total_orders} unique orders ({len(packages)} total packages)")
 
         st.subheader("⚙️ Configuration")
         max_workers = st.slider("Parallel Workers", 1, 8, 4)
@@ -630,7 +635,7 @@ def main():
         batch_id = str(uuid.uuid4()).replace("-", "")[:20]
         st.session_state.batch_id = batch_id
 
-        with st.spinner(f"📤 Getting estimates for ALL {len(packages)} orders..."):
+        with st.spinner(f"📤 Getting estimates for {len(packages)} packages..."):
             all_results = submit_all_shipments(
                 packages, carrier, fallback_client_code.strip(),
                 batch_id=batch_id,
@@ -661,11 +666,11 @@ def main():
                 "Status": r.get("Status", "Unknown"),
                 "BatchID": r.get("BatchID", "N/A"),
                 "TransactionNumber": r.get("TransactionNumber", "N/A"),
-                "Boxes": r.get("Boxes", 0),  # ✅ Now shows correct box count
-                "Cost": r.get("Cost", "$0.00"),  # ✅ TotalAmount (authoritative)
+                "Boxes": r.get("Boxes", 0),
+                "Cost": r.get("Cost", "$0.00"),
                 "BaseAmount": r.get("BaseAmount", ""),
                 "FuelSurcharge": r.get("FuelSurcharge", ""),
-                "PublicTotal": r.get("PublicTotal", ""),  # ✅ Public-facing total
+                "PublicTotal": r.get("PublicTotal", ""),
                 "Service": r.get("Service", ""),
                 "Carrier": r.get("Carrier", ""),
                 "Recipient": r.get("Recipient", ""),
