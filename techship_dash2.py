@@ -368,22 +368,6 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
     session = create_robust_session()
     timeout = 120  # 2 minutes per chunk
     
-    # ✅ Default failed response structure (consistent keys)
-    def failed_response(error_msg):
-        return {
-            "success": False,
-            "cost": 0,
-            "base_amount": 0,
-            "fuel_surcharge": 0,
-            "public_total": 0,
-            "service": "N/A",
-            "carrier": payload.get("CarrierCode", "N/A"),
-            "error": error_msg,
-            "boxes": len(payload.get("Packages", [])),
-            "chunk_num": chunk_num,
-            "total_chunks": total_chunks
-        }
-    
     try:
         payload["ClientCode"] = client_code
         params = {"dryRun": "true" if dry_run else "false"}
@@ -392,24 +376,49 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
 
         if response.status_code != 200:
             error_text = response.text[:200] if response.text else "No details"
-            return failed_response(f"HTTP {response.status_code}: {error_text}")
+            # ✅ Return dict with ALL required keys
+            return {
+                "success": False,
+                "cost": 0.0,
+                "base_amount": 0.0,
+                "fuel_surcharge": 0.0,
+                "public_total": 0.0,
+                "service": "N/A",
+                "carrier": payload.get("CarrierCode", "N/A"),
+                "error": f"HTTP {response.status_code}: {error_text}",
+                "boxes": len(payload.get("Packages", [])),
+                "chunk_num": chunk_num,
+                "total_chunks": total_chunks
+            }
 
         try:
             response_data = response.json()
             if not isinstance(response_data, dict):
                 response_data = {}
         except Exception:
-            return failed_response("Invalid JSON response")
+            return {
+                "success": False,
+                "cost": 0.0,
+                "base_amount": 0.0,
+                "fuel_surcharge": 0.0,
+                "public_total": 0.0,
+                "service": "N/A",
+                "carrier": payload.get("CarrierCode", "N/A"),
+                "error": "Invalid JSON response",
+                "boxes": len(payload.get("Packages", [])),
+                "chunk_num": chunk_num,
+                "total_chunks": total_chunks
+            }
 
         rates = response_data.get("Rates")
         if rates and isinstance(rates, list) and len(rates) > 0:
             best_rate = next((r for r in rates if r.get("IsBest")), rates[0])
             return {
                 "success": True,
-                "cost": best_rate.get("TotalAmount", best_rate.get("Amount", 0)),
-                "base_amount": best_rate.get("BaseAmount", 0),
-                "fuel_surcharge": best_rate.get("FuelSurcharge", 0),
-                "public_total": best_rate.get("PublicTotalAmount", 0),
+                "cost": float(best_rate.get("TotalAmount", best_rate.get("Amount", 0)) or 0),
+                "base_amount": float(best_rate.get("BaseAmount", 0) or 0),
+                "fuel_surcharge": float(best_rate.get("FuelSurcharge", 0) or 0),
+                "public_total": float(best_rate.get("PublicTotalAmount", 0) or 0),
                 "service": best_rate.get("ServiceName", best_rate.get("ServiceCode", "N/A")),
                 "carrier": payload.get("CarrierCode", "N/A"),
                 "error": None,
@@ -418,12 +427,48 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
                 "total_chunks": total_chunks
             }
         else:
-            return failed_response("No rates returned")
+            return {
+                "success": False,
+                "cost": 0.0,
+                "base_amount": 0.0,
+                "fuel_surcharge": 0.0,
+                "public_total": 0.0,
+                "service": "N/A",
+                "carrier": payload.get("CarrierCode", "N/A"),
+                "error": "No rates returned",
+                "boxes": len(payload.get("Packages", [])),
+                "chunk_num": chunk_num,
+                "total_chunks": total_chunks
+            }
 
     except requests.exceptions.Timeout:
-        return failed_response(f"Timeout after {timeout}s")
+        return {
+            "success": False,
+            "cost": 0.0,
+            "base_amount": 0.0,
+            "fuel_surcharge": 0.0,
+            "public_total": 0.0,
+            "service": "N/A",
+            "carrier": payload.get("CarrierCode", "N/A") if payload else "N/A",
+            "error": f"Timeout after {timeout}s",
+            "boxes": len(payload.get("Packages", [])) if payload else 0,
+            "chunk_num": chunk_num,
+            "total_chunks": total_chunks
+        }
     except Exception as e:
-        return failed_response(str(e)[:150])
+        return {
+            "success": False,
+            "cost": 0.0,
+            "base_amount": 0.0,
+            "fuel_surcharge": 0.0,
+            "public_total": 0.0,
+            "service": "N/A",
+            "carrier": payload.get("CarrierCode", "N/A") if payload else "N/A",
+            "error": str(e)[:150],
+            "boxes": len(payload.get("Packages", [])) if payload else 0,
+            "chunk_num": chunk_num,
+            "total_chunks": total_chunks
+        }
     finally:
         session.close()
 
@@ -500,16 +545,59 @@ def submit_all_shipments(packages, carrier, fallback_client_code, batch_id, dry_
             
             # Collect chunk results
             for future in concurrent.futures.as_completed(futures):
-                result = future.result()
-                if result:  # ✅ Ensure result is not None
-                    chunk_results.append(result)
+                try:
+                    result = future.result()
+                    # ✅ Ensure result is valid dict with required keys
+                    if result and isinstance(result, dict) and "success" in result:
+                        chunk_results.append(result)
+                    else:
+                        # Create fallback result if none returned
+                        chunk_results.append({
+                            "success": False,
+                            "cost": 0.0,
+                            "base_amount": 0.0,
+                            "fuel_surcharge": 0.0,
+                            "public_total": 0.0,
+                            "service": "N/A",
+                            "carrier": carrier,
+                            "error": "No result returned from chunk",
+                            "boxes": 0,
+                            "chunk_num": len(chunk_results) + 1,
+                            "total_chunks": num_chunks
+                        })
+                except Exception as e:
+                    chunk_results.append({
+                        "success": False,
+                        "cost": 0.0,
+                        "base_amount": 0.0,
+                        "fuel_surcharge": 0.0,
+                        "public_total": 0.0,
+                        "service": "N/A",
+                        "carrier": carrier,
+                        "error": f"Future exception: {str(e)[:100]}",
+                        "boxes": 0,
+                        "chunk_num": len(chunk_results) + 1,
+                        "total_chunks": num_chunks
+                    })
         
-        # ✅ Sum up all chunk results for this order (with safe defaults)
-        total_cost = sum(r.get("cost", 0) for r in chunk_results if r.get("success", False))
-        total_base = sum(r.get("base_amount", 0) for r in chunk_results if r.get("success", False))
-        total_fuel = sum(r.get("fuel_surcharge", 0) for r in chunk_results if r.get("success", False))
-        total_public = sum(r.get("public_total", 0) for r in chunk_results if r.get("success", False))
-        successful_chunks = sum(1 for r in chunk_results if r.get("success", False))
+        # ✅ Sum up all chunk results with MAXIMUM safety
+        total_cost = 0.0
+        total_base = 0.0
+        total_fuel = 0.0
+        total_public = 0.0
+        successful_chunks = 0
+        
+        for r in chunk_results:
+            if isinstance(r, dict) and r.get("success") is True:
+                try:
+                    total_cost += float(r.get("cost", 0) or 0)
+                    total_base += float(r.get("base_amount", 0) or 0)
+                    total_fuel += float(r.get("fuel_surcharge", 0) or 0)
+                    total_public += float(r.get("public_total", 0) or 0)
+                    successful_chunks += 1
+                except (TypeError, ValueError):
+                    pass  # Skip this chunk if values can't be converted
+        
         failed_chunks = num_chunks - successful_chunks
         
         # Get service info from first successful chunk
@@ -517,15 +605,15 @@ def submit_all_shipments(packages, carrier, fallback_client_code, batch_id, dry_
         carrier_info = carrier
         error_info = None
         for r in chunk_results:
-            if r.get("success"):
-                service_info = r.get("service", "N/A")
-                carrier_info = r.get("carrier", carrier)
+            if isinstance(r, dict) and r.get("success") is True:
+                service_info = r.get("service", "N/A") or "N/A"
+                carrier_info = r.get("carrier", carrier) or carrier
                 break
         
         if failed_chunks > 0:
             error_parts = []
             for r in chunk_results:
-                if not r.get("success") and r.get("error"):
+                if isinstance(r, dict) and not r.get("success") and r.get("error"):
                     error_parts.append(f"Chunk {r.get('chunk_num', '?')}: {r.get('error', 'Unknown')}")
             if error_parts:
                 error_info = "; ".join(error_parts[:3])  # Show first 3 errors
