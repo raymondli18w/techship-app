@@ -73,7 +73,7 @@ def create_robust_session():
 
 def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_num=1, total_chunks=1):
     session = create_robust_session()
-    timeout = 60  # ✅ Reduced timeout for single orders
+    timeout = 60
     
     try:
         payload["ClientCode"] = client_code
@@ -133,21 +133,17 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
 def process_single_order(row, fallback_client_code, batch_id, dry_run=True, chunk_size=50):
     """Process a SINGLE order with chunking for large box counts"""
     try:
-        # Extract data from row
         num_boxes = safe_float(row.get('boxes', 1), 1.0)
         if num_boxes < 1:
             num_boxes = 1
-        
-        # Limit boxes per order to prevent API overload
         if num_boxes > 50:
-            num_boxes = 50  # Cap at 50 boxes per order for speed
+            num_boxes = 50
         
         weight = safe_float(row.get('weight', 1), 1.0)
         length = safe_float(row.get('length') or row.get('lwh', 10), 10)
         width = safe_float(row.get('width') or row.get('lwh', 10), 10)
         height = safe_float(row.get('height') or row.get('lwh', 10), 10)
         
-        # Fix unrealistic dimensions
         if length > 1000 or width > 1000 or height > 1000:
             length = safe_float(row.get('length', 10), 10)
             width = safe_float(row.get('width', 10), 10)
@@ -190,7 +186,6 @@ def process_single_order(row, fallback_client_code, batch_id, dry_run=True, chun
             "OrderID": str(row.get('order_id', f'ORD-{row.get("order_id", "")}'))[:20]
         }]
         
-        # Process with chunking (for boxes > 1)
         total_boxes = int(num_boxes)
         num_chunks = max(1, (total_boxes + chunk_size - 1) // chunk_size)
         
@@ -198,7 +193,6 @@ def process_single_order(row, fallback_client_code, batch_id, dry_run=True, chun
         transaction_number = str(uuid.uuid4()).replace("-", "")[:20]
         customer_order = order_packages[0]["OrderID"]
         
-        # Process chunks sequentially (not parallel) to avoid API jamming
         for chunk_num, start_idx in enumerate(range(0, total_boxes, chunk_size), 1):
             chunk_packages = order_packages * min(chunk_size, total_boxes - start_idx)
             packages_array = [{
@@ -221,7 +215,6 @@ def process_single_order(row, fallback_client_code, batch_id, dry_run=True, chun
             result = submit_chunk(payload, client_code_val, customer_order, batch_id, dry_run, chunk_num, num_chunks)
             chunk_results.append(result)
         
-        # Sum results
         total_cost = sum(safe_float(r.get("cost", 0)) for r in chunk_results if r.get("success"))
         total_base = sum(safe_float(r.get("base_amount", 0)) for r in chunk_results if r.get("success"))
         total_fuel = sum(safe_float(r.get("fuel_surcharge", 0)) for r in chunk_results if r.get("success"))
@@ -290,7 +283,7 @@ def add_selectable_css():
 def main():
     add_selectable_css()
     st.title("📦 TechSHIP Bulk Rate Estimator")
-    st.markdown("### ⚡ One Order at a Time — Fast & Stable")
+    st.markdown("### ⚡ Auto-Continue Mode — Process Overnight")
 
     fallback_client_code = st.text_input("Fallback Client Code", value="8470HWY50")
     if not fallback_client_code.strip():
@@ -299,16 +292,27 @@ def main():
 
     dry_run = st.checkbox("🔒 Dry Run Mode (Estimates Only)", value=True)
     chunk_size = st.sidebar.slider("📦 Boxes Per API Call", 25, 100, 50)
+    
+    # ✅ AUTO-CONTINUE SETTINGS
+    auto_continue = st.sidebar.checkbox("🔄 Auto-Continue Mode", value=False, 
+                                        help="Automatically process orders one at a time until complete")
+    delay_seconds = st.sidebar.slider("⏱️ Delay Between Orders (seconds)", 1, 10, 3, 
+                                      help="Wait time between each order to avoid API rate limiting")
 
     with st.sidebar:
         st.header("📊 Progress")
         st.info("""
         **How It Works:**
         1. Upload file ONCE
-        2. Process 1 order at a time (~3-5 sec)
-        3. Click Refresh to continue
-        4. Download anytime
+        2. Enable Auto-Continue Mode
+        3. Orders process automatically (1 at a time)
+        4. Come back to complete report!
         """)
+        
+        if auto_continue:
+            st.success("🔄 **Auto-Continue ON** — Will process continuously!")
+        else:
+            st.warning("⏸️ **Auto-Continue OFF** — Manual processing")
         
         if dry_run:
             st.warning("⚠️ Dry Run ON")
@@ -333,6 +337,10 @@ def main():
         st.session_state.total_orders = 0
     if "processing_complete" not in st.session_state:
         st.session_state.processing_complete = False
+    if "auto_processing" not in st.session_state:
+        st.session_state.auto_processing = False
+    if "last_process_time" not in st.session_state:
+        st.session_state.last_process_time = 0
 
     # FILE UPLOAD (Only Once)
     if not st.session_state.file_uploaded:
@@ -390,66 +398,119 @@ def main():
             last = st.session_state.all_results[-1]
             st.info(f"📦 Last: {last.get('OrderID', 'N/A')} - {last.get('Cost', '$0.00')} - {last.get('Status', 'N/A')}")
         
-        # ✅ SINGLE ORDER PROCESSING BUTTONS
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            # Process ONE order
-            if remaining > 0 and not st.session_state.processing_complete:
-                if st.button("▶️ Process 1 Order", type="primary", use_container_width=True):
-                    idx = processed
-                    row = st.session_state.all_orders[idx]
-                    
-                    with st.spinner(f"⏳ Processing order {idx + 1} of {total}..."):
-                        result = process_single_order(row, fallback_client_code.strip(), st.session_state.batch_id, dry_run, chunk_size)
-                        
-                        st.session_state.all_results.append(result)
-                        st.session_state.processed_indices.append(idx)
-                        
-                        if result.get("Status", "").startswith("✅"):
-                            st.success(f"✅ {result.get('OrderID')}: {result.get('Cost')}")
-                        else:
-                            st.warning(f"⚠️ {result.get('OrderID')}: {result.get('Error', 'Failed')}")
-                        
-                        if len(st.session_state.processed_indices) >= total:
-                            st.session_state.processing_complete = True
-                            st.balloons()
-                        
-                        st.rerun()
-        
-        with col2:
-            # Process 10 orders
-            if remaining > 0 and not st.session_state.processing_complete:
-                if st.button("▶️ Process 10 Orders", use_container_width=True):
-                    start_idx = processed
-                    end_idx = min(start_idx + 10, total)
-                    
-                    with st.spinner(f"⏳ Processing orders {start_idx + 1}-{end_idx}..."):
-                        for idx in range(start_idx, end_idx):
-                            row = st.session_state.all_orders[idx]
-                            result = process_single_order(row, fallback_client_code.strip(), st.session_state.batch_id, dry_run, chunk_size)
-                            st.session_state.all_results.append(result)
-                            st.session_state.processed_indices.append(idx)
-                        
-                        if len(st.session_state.processed_indices) >= total:
-                            st.session_state.processing_complete = True
-                            st.balloons()
-                        
-                        st.rerun()
-        
-        with col3:
-            if st.button("🔄 Refresh", use_container_width=True):
+        # ✅ AUTO-CONTINUE LOGIC
+        if auto_continue and remaining > 0 and not st.session_state.processing_complete:
+            # Check if enough time has passed since last process
+            current_time = time.time()
+            time_since_last = current_time - st.session_state.last_process_time
+            
+            if time_since_last >= delay_seconds or st.session_state.last_process_time == 0:
+                # Process next order
+                idx = processed
+                row = st.session_state.all_orders[idx]
+                
+                status_container = st.empty()
+                with status_container:
+                    st.info(f"⏳ Processing order {idx + 1} of {total}...")
+                
+                result = process_single_order(row, fallback_client_code.strip(), st.session_state.batch_id, dry_run, chunk_size)
+                
+                st.session_state.all_results.append(result)
+                st.session_state.processed_indices.append(idx)
+                st.session_state.last_process_time = time.time()
+                
+                # Show result briefly
+                with status_container:
+                    if result.get("Status", "").startswith("✅"):
+                        st.success(f"✅ {result.get('OrderID')}: {result.get('Cost')} ({idx + 1}/{total})")
+                    else:
+                        st.warning(f"⚠️ {result.get('OrderID')}: {result.get('Error', 'Failed')}")
+                
+                # Check if complete
+                if len(st.session_state.processed_indices) >= total:
+                    st.session_state.processing_complete = True
+                    st.session_state.auto_processing = False
+                    st.balloons()
+                    st.success(f"🎉 All {total} orders processed!")
+                
+                # Auto-rerun for next order
+                if not st.session_state.processing_complete:
+                    time.sleep(0.5)  # Small delay before rerun
+                    st.rerun()
+            else:
+                # Show countdown
+                countdown = int(delay_seconds - time_since_last)
+                st.info(f"⏱️ Next order in {countdown} seconds... ({processed + 1}/{total})")
+                time.sleep(1)
                 st.rerun()
         
-        with col4:
-            if st.session_state.all_results:
-                csv = pd.DataFrame(st.session_state.all_results).to_csv(index=False).encode('utf-8')
-                st.download_button("💾 Download", csv, f"techship_{st.session_state.batch_id}.csv", "text/csv", use_container_width=True)
+        # ✅ MANUAL PROCESSING BUTTONS (shown when auto-continue is off or complete)
+        if not auto_continue or st.session_state.processing_complete:
+            col1, col2, col3, col4 = st.columns(4)
+            
+            with col1:
+                if remaining > 0 and not st.session_state.processing_complete:
+                    if st.button("▶️ Process 1 Order", type="primary" if not auto_continue else "secondary", use_container_width=True):
+                        idx = processed
+                        row = st.session_state.all_orders[idx]
+                        
+                        with st.spinner(f"⏳ Processing order {idx + 1} of {total}..."):
+                            result = process_single_order(row, fallback_client_code.strip(), st.session_state.batch_id, dry_run, chunk_size)
+                            
+                            st.session_state.all_results.append(result)
+                            st.session_state.processed_indices.append(idx)
+                            
+                            if len(st.session_state.processed_indices) >= total:
+                                st.session_state.processing_complete = True
+                                st.balloons()
+                            
+                            st.rerun()
+            
+            with col2:
+                if remaining > 0 and not st.session_state.processing_complete:
+                    if st.button("▶️ Process 10 Orders", use_container_width=True):
+                        start_idx = processed
+                        end_idx = min(start_idx + 10, total)
+                        
+                        with st.spinner(f"⏳ Processing orders {start_idx + 1}-{end_idx}..."):
+                            for idx in range(start_idx, end_idx):
+                                row = st.session_state.all_orders[idx]
+                                result = process_single_order(row, fallback_client_code.strip(), st.session_state.batch_id, dry_run, chunk_size)
+                                st.session_state.all_results.append(result)
+                                st.session_state.processed_indices.append(idx)
+                            
+                            if len(st.session_state.processed_indices) >= total:
+                                st.session_state.processing_complete = True
+                                st.balloons()
+                            
+                            st.rerun()
+            
+            with col3:
+                if st.button("🔄 Refresh", use_container_width=True):
+                    st.rerun()
+            
+            with col4:
+                if st.session_state.all_results:
+                    csv = pd.DataFrame(st.session_state.all_results).to_csv(index=False).encode('utf-8')
+                    st.download_button("💾 Download", csv, f"techship_{st.session_state.batch_id}.csv", "text/csv", use_container_width=True)
+        
+        # ✅ AUTO-CONTINUE CONTROLS
+        if auto_continue and remaining > 0 and not st.session_state.processing_complete:
+            st.divider()
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("⏸️ Pause Auto-Continue", type="secondary", use_container_width=True):
+                    st.session_state.auto_processing = False
+                    st.rerun()
+            with col2:
+                if st.button("💾 Download Progress Now", use_container_width=True):
+                    csv = pd.DataFrame(st.session_state.all_results).to_csv(index=False).encode('utf-8')
+                    st.download_button("💾 Download Partial Results", csv, f"techship_partial_{st.session_state.batch_id}.csv", "text/csv", use_container_width=True)
         
         # RESET BUTTON
         if st.button("🗑️ Reset & New File"):
-            for key in ["file_uploaded", "all_orders", "processed_indices", "all_results", "batch_id", "total_orders", "processing_complete"]:
-                st.session_state[key] = [] if key in ["all_orders", "processed_indices", "all_results"] else "" if key == "batch_id" else False if key in ["file_uploaded", "processing_complete"] else 0 if key == "total_orders" else None
+            for key in ["file_uploaded", "all_orders", "processed_indices", "all_results", "batch_id", "total_orders", "processing_complete", "auto_processing", "last_process_time"]:
+                st.session_state[key] = [] if key in ["all_orders", "processed_indices", "all_results"] else "" if key == "batch_id" else False if key in ["file_uploaded", "processing_complete", "auto_processing"] else 0 if key == "total_orders" else 0
             st.rerun()
         
         # DISPLAY RESULTS
@@ -473,10 +534,20 @@ def main():
         
         # REMAINING INFO
         if remaining > 0:
-            st.info(f"⏭️ {remaining} orders remaining. Click **Process 1 Order** to continue.")
-            st.write("⏱️ Est. time per order: ~3-5 seconds")
+            if auto_continue:
+                st.info(f"🔄 **Auto-Processing:** {remaining} orders remaining. Will continue automatically...")
+                est_time = remaining * delay_seconds
+                st.write(f"⏱️ Est. time remaining: ~{est_time // 60} minutes {est_time % 60} seconds")
+            else:
+                st.info(f"⏭️ {remaining} orders remaining. Click **Process 1 Order** or enable **Auto-Continue Mode**.")
+                st.write("⏱️ Est. time per order: ~3-5 seconds")
         else:
             st.success("🎉 All orders processed!")
+            
+            # Final download button
+            if st.session_state.all_results:
+                csv = pd.DataFrame(st.session_state.all_results).to_csv(index=False).encode('utf-8')
+                st.download_button("💾 Download Final Report", csv, f"techship_FINAL_{st.session_state.batch_id}.csv", "text/csv", type="primary", use_container_width=True)
 
 if __name__ == "__main__":
     main()
