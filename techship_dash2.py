@@ -53,7 +53,6 @@ for carrier, info in CARRIER_SERVICE_MAP.items():
 # Helper Functions
 # =========================
 def safe_float(value, default=0.0):
-    """Safely convert value to float, handling NaN/None/invalid values"""
     if value is None:
         return default
     try:
@@ -65,7 +64,6 @@ def safe_float(value, default=0.0):
         return default
 
 def safe_string(value, default=""):
-    """Safely convert value to string, handling NaN/None"""
     if value is None or (isinstance(value, float) and math.isnan(value)):
         return default
     return str(value).strip()
@@ -134,7 +132,7 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
             return {
                 "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
                 "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
-                "error": f"No rates returned. Check: City={payload.get('ShipToAddress', {}).get('City', 'N/A')}, Postal={payload.get('ShipToAddress', {}).get('Postal', 'N/A')}, ClientCode={client_code}",
+                "error": f"No rates returned. Carrier={payload.get('CarrierCode')}, Service={payload.get('Routing', {}).get('ServiceCode')}, Postal={payload.get('ShipToAddress', {}).get('Postal')}",
                 "boxes": len(payload.get("Packages", [])),
                 "chunk_num": chunk_num, "total_chunks": total_chunks,
                 "raw_response": str(response_data)[:300]
@@ -155,7 +153,7 @@ def process_single_order(row, fallback_client_code, batch_id, dry_run=True, chun
         if num_boxes < 1:
             num_boxes = 1
         if num_boxes > 100:
-            num_boxes = 100  # Cap at 100 for API stability
+            num_boxes = 100
         
         num_chunks = math.ceil(num_boxes / chunk_size)
         
@@ -164,60 +162,56 @@ def process_single_order(row, fallback_client_code, batch_id, dry_run=True, chun
         width = safe_float(row.get('width') or row.get('lwh', 10), 10)
         height = safe_float(row.get('height') or row.get('lwh', 10), 10)
         
-        # Fix unrealistic dimensions
         if length > 1000 or width > 1000 or height > 1000:
             length = safe_float(row.get('length', 10), 10)
             width = safe_float(row.get('width', 10), 10)
             height = safe_float(row.get('height', 10), 10)
         
-        # ✅ FIX: Handle missing city - use Toronto as default for Canadian addresses
         city = safe_string(row.get('city', ''), 'Toronto')
         if not city:
             city = "Toronto"
         
-        # ✅ FIX: Validate province
         province = safe_string(row.get('province', 'ON'), 'ON').upper()[:2]
         if province not in ['AB', 'BC', 'MB', 'NB', 'NL', 'NS', 'NT', 'NU', 'ON', 'PE', 'QC', 'SK', 'YT']:
             province = 'ON'
         
-        # ✅ FIX: Validate country
         country = safe_string(row.get('country', 'CA'), 'CA').upper()
         if not country or country not in ['CA', 'CAN', 'USA', 'US']:
             country = "CA"
         
-        # ✅ FIX: Validate postal code
         postal = safe_string(row.get('postal', ''), 'M5V1J1').replace(" ", "").upper()[:10]
         if len(postal) < 5:
             postal = "M5V1J1"
         
-        # ✅ FIX: Fill empty email with default
         email = safe_string(row.get('email', ''), 'test@test.com')
         if not email or '@' not in email:
             email = "test@test.com"
         
-        # ✅ FIX: For RS or empty service, use Purolator Ground (more reliable)
+        # ✅ FIX: Properly handle RS carrier code for RateShopping
         carrier_input = safe_string(row.get('carrier', ''), '').upper()
         service_level = safe_string(row.get('services', ''), '')
         
-        if carrier_input in ['RS', ''] or not service_level:
-            carrier_code = "PURO"
-            service_code = "P"  # Purolator Ground
+        # Determine carrier and service code
+        if carrier_input == 'RS' or (carrier_input == '' and service_level == ''):
+            # ✅ RateShopping - use RS carrier code with empty service
+            actual_carrier_code = "RS"
+            service_code = ""
+        elif carrier_input in CARRIER_SERVICE_MAP:
+            # ✅ Known carrier - use it
+            actual_carrier_code = CARRIER_SERVICE_MAP[carrier_input]["CarrierCode"]
+            service_code = service_level if service_level else ""
+        elif service_level in SERVICE_TO_CARRIER:
+            # ✅ Service code maps to a carrier
+            actual_carrier_code = CARRIER_SERVICE_MAP[SERVICE_TO_CARRIER[service_level]]["CarrierCode"]
         else:
-            carrier_code = carrier_input
-            service_code = service_level
-        
-        # Map to actual carrier code
-        if carrier_code in CARRIER_SERVICE_MAP:
-            actual_carrier_code = CARRIER_SERVICE_MAP[carrier_code]["CarrierCode"]
-        else:
-            actual_carrier_code = "PURO"
-            service_code = "P"
+            # ✅ Default to RS for rate shopping
+            actual_carrier_code = "RS"
+            service_code = ""
         
         chunk_results = []
         transaction_number = str(uuid.uuid4()).replace("-", "")[:20]
         customer_order = safe_string(row.get('order_id', f'ORD-{uuid.uuid4().hex[:8]}'))[:20]
         
-        # Process each chunk
         for chunk_num in range(1, num_chunks + 1):
             boxes_in_chunk = int(min(chunk_size, num_boxes - ((chunk_num - 1) * chunk_size)))
             
@@ -245,7 +239,7 @@ def process_single_order(row, fallback_client_code, batch_id, dry_run=True, chun
                 "CarrierCode": actual_carrier_code,
                 "Routing": {
                     "CarrierCode": actual_carrier_code,
-                    "ServiceCode": service_code,
+                    "ServiceCode": service_code,  # ✅ Empty for RS
                     "FreightPaymentTerms": "Prepaid"
                 },
                 "ShipToAddress": {
@@ -258,18 +252,16 @@ def process_single_order(row, fallback_client_code, batch_id, dry_run=True, chun
                     "Postal": postal,
                     "Country": country,
                     "Phone": safe_string(row.get('phone', '6045555555')),
-                    "Email": email  # ✅ Now includes email
+                    "Email": email
                 },
                 "Packages": packages_array
             }
             
-            # ✅ Keep client code as-is (8470HWY50 is valid)
             client_code_val = safe_string(row.get('client_code', fallback_client_code)) or fallback_client_code
             
             result = submit_chunk(payload, client_code_val, customer_order, batch_id, dry_run, chunk_num, num_chunks)
             chunk_results.append(result)
         
-        # Sum results
         total_cost = sum(safe_float(r.get("cost", 0)) for r in chunk_results if r.get("success"))
         total_base = sum(safe_float(r.get("base_amount", 0)) for r in chunk_results if r.get("success"))
         total_fuel = sum(safe_float(r.get("fuel_surcharge", 0)) for r in chunk_results if r.get("success"))
@@ -346,7 +338,7 @@ def add_selectable_css():
 def main():
     add_selectable_css()
     st.title("📦 TechSHIP Bulk Rate Estimator")
-    st.markdown("### Auto-Continue Mode — Large Orders Auto-Split")
+    st.markdown("### RS Carrier Code Supported — RateShopping Enabled")
 
     fallback_client_code = st.text_input("Fallback Client Code", value="8470HWY50")
     if not fallback_client_code.strip():
@@ -359,21 +351,20 @@ def main():
     with st.sidebar:
         st.header("📊 Progress")
         st.info("""
-        **Improvements Applied:**
-        1. Empty city → Toronto default
-        2. Empty email → test@test.com
-        3. RS → Purolator Ground (P)
-        4. Client code preserved as-is
-        5. Better error messages
+        **Carrier Support:**
+        - RS = RateShopping (empty service)
+        - FEDEX = F1, F2, F3
+        - PURO = P, PXPU
+        - UPS = U, EXP1
+        - UNI, UBI, CANPAR
         """)
         
-        auto_continue = st.checkbox("🔄 Auto-Continue Mode", value=False,
-                                    help="Automatically process orders one at a time until complete")
+        auto_continue = st.checkbox("🔄 Auto-Continue Mode", value=False)
         
         if auto_continue:
-            st.success("🔄 **Auto-Continue ON** — Will process continuously!")
+            st.success("🔄 **Auto-Continue ON**")
         else:
-            st.warning("⏸️ **Auto-Continue OFF** — Manual processing")
+            st.warning("⏸️ **Auto-Continue OFF**")
         
         delay_seconds = st.slider("⏱️ Delay Between Orders (seconds)", 1, 10, 2)
         
@@ -433,21 +424,6 @@ def main():
                         st.error("❌ Missing required columns: name, services")
                         st.stop()
                     
-                    # DATA QUALITY REPORT
-                    empty_cities = df['city'].isna().sum() if 'city' in df.columns else len(df)
-                    empty_emails = df['email'].isna().sum() if 'email' in df.columns else len(df)
-                    empty_postal = df['postal'].isna().sum() if 'postal' in df.columns else len(df)
-                    
-                    st.warning(f"""
-                    **📋 Data Quality Report:**
-                    - Total orders: {len(df)}
-                    - Empty city fields: {empty_cities} ({empty_cities*100//len(df)}%) → Will default to Toronto
-                    - Empty email fields: {empty_emails} ({empty_emails*100//len(df)}%) → Will default to test@test.com
-                    - Empty postal fields: {empty_postal} ({empty_postal*100//len(df)}%) → Will default to M5V1J1
-                    
-                    **✅ Script will auto-fix these issues during processing**
-                    """)
-                    
                     st.session_state.all_orders = df.to_dict('records')
                     st.session_state.total_orders = len(df)
                     st.session_state.file_uploaded = True
@@ -459,7 +435,6 @@ def main():
                 except Exception as e:
                     st.error(f"❌ Parse error: {str(e)}")
     else:
-        # FILE ALREADY LOADED
         processed = len(st.session_state.processed_indices)
         total = st.session_state.total_orders
         remaining = total - processed
@@ -471,7 +446,7 @@ def main():
         
         if st.session_state.all_results:
             last = st.session_state.all_results[-1]
-            st.info(f"📦 Last: {last.get('OrderID', 'N/A')} - {last.get('City', 'N/A')}, {last.get('Province', 'N/A')} - {last.get('Cost', '$0.00')} - {last.get('Status', 'N/A')}")
+            st.info(f"📦 Last: {last.get('OrderID', 'N/A')} - {last.get('Carrier', 'N/A')} - {last.get('Cost', '$0.00')} - {last.get('Status', 'N/A')}")
         
         # AUTO-CONTINUE LOGIC
         if auto_continue and remaining > 0 and not st.session_state.processing_complete:
@@ -494,7 +469,7 @@ def main():
                 
                 with status_container:
                     if result.get("Status", "").startswith("✅"):
-                        st.success(f"✅ {result.get('OrderID')}: {result.get('City')}, {result.get('Province')} - {result.get('Cost')} ({idx + 1}/{total})")
+                        st.success(f"✅ {result.get('OrderID')}: {result.get('Carrier')} - {result.get('Cost')} ({idx + 1}/{total})")
                     else:
                         st.warning(f"⚠️ {result.get('OrderID')}: {result.get('Error', 'Failed')[:150]}")
                 
@@ -529,7 +504,7 @@ def main():
                             st.session_state.processed_indices.append(idx)
                             
                             if result.get("Status", "").startswith("✅"):
-                                st.success(f"✅ {result.get('OrderID')}: {result.get('City')}, {result.get('Province')} - {result.get('Cost')}")
+                                st.success(f"✅ {result.get('OrderID')}: {result.get('Carrier')} - {result.get('Cost')}")
                             else:
                                 st.error(f"❌ {result.get('OrderID')}: {result.get('Error', 'Failed')[:200]}")
                             
@@ -591,7 +566,7 @@ def main():
             st.subheader(f"📊 Results ({len(st.session_state.all_results)} orders)")
             
             results_df = pd.DataFrame(st.session_state.all_results)
-            display_cols = ["OrderID", "Status", "City", "Province", "Boxes", "Chunks", "Cost", "Service", "Carrier"]
+            display_cols = ["OrderID", "Status", "Carrier", "Service", "Boxes", "Cost", "City", "PostalCode"]
             if "Error" in results_df.columns:
                 display_cols.append("Error")
             
@@ -604,25 +579,15 @@ def main():
             col2.metric("Failed", len(st.session_state.all_results) - success)
             total_cost = sum(safe_float(r.get('Cost', '$0').replace('$', '')) for r in st.session_state.all_results)
             col3.metric("Total Cost", f"${total_cost:.2f}")
-            
-            # Show error summary
-            if len(st.session_state.all_results) > 0:
-                failed = [r for r in st.session_state.all_results if not r.get("Status", "").startswith("✅")]
-                if failed:
-                    st.error(f"**{len(failed)} orders failed.** Common issues:")
-                    error_samples = [r.get('Error', '')[:150] for r in failed[:5]]
-                    for err in set(error_samples):
-                        st.write(f"- {err}")
-                    st.info("💡 **Fix:** Verify client code `8470HWY50` is active for rate estimates with TechSHIP support")
         
         # REMAINING INFO
         if remaining > 0:
             if auto_continue:
-                st.info(f"🔄 **Auto-Processing:** {remaining} orders remaining. Will continue automatically...")
+                st.info(f"🔄 **Auto-Processing:** {remaining} orders remaining...")
                 est_time = remaining * delay_seconds
-                st.write(f"⏱️ Est. time remaining: ~{est_time // 60} minutes {est_time % 60} seconds")
+                st.write(f"⏱️ Est. time: ~{est_time // 60} min {est_time % 60} sec")
             else:
-                st.info(f"⏭️ {remaining} orders remaining. Click **Process 1 Order** or enable **Auto-Continue Mode**.")
+                st.info(f"⏭️ {remaining} orders remaining.")
         else:
             st.success("🎉 All orders processed!")
             
