@@ -70,17 +70,8 @@ def safe_string(value, default=""):
 
 def create_robust_session():
     session = requests.Session()
-    retry_strategy = Retry(
-        total=3,
-        backoff_factor=2,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["POST"]
-    )
-    adapter = HTTPAdapter(
-        max_retries=retry_strategy,
-        pool_connections=200,
-        pool_maxsize=200
-    )
+    retry_strategy = Retry(total=3, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
+    adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=200, pool_maxsize=200)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     return session
@@ -90,99 +81,107 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
     session = create_robust_session()
     timeout = 60
     
-    for attempt in range(max_retries):
-        try:
-            payload["ClientCode"] = client_code
-            params = {"dryRun": "true" if dry_run else "false"}
-            
-            response = session.post(API_URL, headers=HEADERS, json=payload, params=params, timeout=timeout)
+    try:
+        for attempt in range(max_retries):
+            try:
+                payload["ClientCode"] = client_code
+                params = {"dryRun": "true" if dry_run else "false"}
+                
+                response = session.post(API_URL, headers=HEADERS, json=payload, params=params, timeout=timeout)
 
-            # ✅ SUCCESS
-            if response.status_code == 200:
-                try:
-                    response_data = response.json()
-                    if not isinstance(response_data, dict):
-                        response_data = {}
-                except Exception:
+                # SUCCESS
+                if response.status_code == 200:
+                    try:
+                        response_data = response.json()
+                        if not isinstance(response_data, dict):
+                            response_data = {}
+                    except Exception:
+                        if attempt < max_retries - 1:
+                            time.sleep(2 ** attempt)
+                            continue
+                        return {
+                            "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
+                            "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
+                            "error": "Invalid JSON response", "boxes": len(payload.get("Packages", [])),
+                            "chunk_num": chunk_num, "total_chunks": total_chunks
+                        }
+
+                    rates = response_data.get("Rates", [])
+                    if rates and len(rates) > 0:
+                        best_rate = next((r for r in rates if r.get("IsBest")), rates[0])
+                        return {
+                            "success": True,
+                            "cost": safe_float(best_rate.get("TotalAmount", best_rate.get("Amount", 0))),
+                            "base_amount": safe_float(best_rate.get("BaseAmount", 0)),
+                            "fuel_surcharge": safe_float(best_rate.get("FuelSurcharge", 0)),
+                            "public_total": safe_float(best_rate.get("PublicTotalAmount", 0)),
+                            "service": best_rate.get("ServiceName", best_rate.get("ServiceCode", "N/A")),
+                            "carrier": payload.get("CarrierCode", "N/A"), "error": None,
+                            "boxes": len(payload.get("Packages", [])), "chunk_num": chunk_num, "total_chunks": total_chunks
+                        }
+                    else:
+                        if attempt < max_retries - 1:
+                            time.sleep(2 ** attempt)
+                            continue
+                        return {
+                            "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
+                            "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
+                            "error": "No rates returned", "boxes": len(payload.get("Packages", [])),
+                            "chunk_num": chunk_num, "total_chunks": total_chunks
+                        }
+
+                # HTTP 500 - RETRY
+                elif response.status_code == 500:
                     if attempt < max_retries - 1:
-                        time.sleep(2 ** attempt)  # Exponential backoff
+                        wait_time = 2 ** attempt
+                        time.sleep(wait_time)
                         continue
-                    return {
-                        "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
-                        "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
-                        "error": "Invalid JSON response", "boxes": len(payload.get("Packages", [])),
-                        "chunk_num": chunk_num, "total_chunks": total_chunks
-                    }
+                    else:
+                        error_text = response.text[:300] if response.text else "Server error"
+                        return {
+                            "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
+                            "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
+                            "error": f"HTTP 500: {error_text} (after {max_retries} retries)",
+                            "boxes": len(payload.get("Packages", [])),
+                            "chunk_num": chunk_num, "total_chunks": total_chunks
+                        }
 
-                rates = response_data.get("Rates", [])
-                if rates and len(rates) > 0:
-                    best_rate = next((r for r in rates if r.get("IsBest")), rates[0])
-                    return {
-                        "success": True,
-                        "cost": safe_float(best_rate.get("TotalAmount", best_rate.get("Amount", 0))),
-                        "base_amount": safe_float(best_rate.get("BaseAmount", 0)),
-                        "fuel_surcharge": safe_float(best_rate.get("FuelSurcharge", 0)),
-                        "public_total": safe_float(best_rate.get("PublicTotalAmount", 0)),
-                        "service": best_rate.get("ServiceName", best_rate.get("ServiceCode", "N/A")),
-                        "carrier": payload.get("CarrierCode", "N/A"), "error": None,
-                        "boxes": len(payload.get("Packages", [])), "chunk_num": chunk_num, "total_chunks": total_chunks
-                    }
+                # OTHER ERRORS
                 else:
-                    if attempt < max_retries - 1:
-                        time.sleep(2 ** attempt)
-                        continue
+                    error_text = response.text[:300] if response.text else "No details"
                     return {
                         "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
                         "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
-                        "error": "No rates returned", "boxes": len(payload.get("Packages", [])),
-                        "chunk_num": chunk_num, "total_chunks": total_chunks
-                    }
-
-            # ✅ HTTP 500 - RETRY
-            elif response.status_code == 500:
-                if attempt < max_retries - 1:
-                    wait_time = 2 ** attempt  # 2s, 4s, 8s
-                    time.sleep(wait_time)
-                    continue
-                else:
-                    error_text = response.text[:300] if response.text else "Server error"
-                    return {
-                        "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
-                        "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
-                        "error": f"HTTP 500: {error_text} (after {max_retries} retries)",
+                        "error": f"HTTP {response.status_code}: {error_text}",
                         "boxes": len(payload.get("Packages", [])),
                         "chunk_num": chunk_num, "total_chunks": total_chunks
                     }
 
-            # ✅ OTHER ERRORS
-            else:
-                error_text = response.text[:300] if response.text else "No details"
+            except requests.exceptions.Timeout:
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
                 return {
                     "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
-                    "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
-                    "error": f"HTTP {response.status_code}: {error_text}",
-                    "boxes": len(payload.get("Packages", [])),
-                    "chunk_num": chunk_num, "total_chunks": total_chunks
+                    "public_total": 0.0, "service": "N/A", "carrier": "N/A", "error": f"Timeout after {timeout}s",
+                    "boxes": 0, "chunk_num": chunk_num, "total_chunks": total_chunks
                 }
-
-        except requests.exceptions.Timeout:
-            if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)
-                continue
-            return {
-                "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
-                "public_total": 0.0, "service": "N/A", "carrier": "N/A", "error": f"Timeout after {timeout}s",
-                "boxes": 0, "chunk_num": chunk_num, "total_chunks": total_chunks
-            }
-        except Exception as e:
-            if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)
-                continue
-            return {
-                "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
-                "public_total": 0.0, "service": "N/A", "carrier": "N/A", "error": str(e)[:200],
-                "boxes": 0, "chunk_num": chunk_num, "total_chunks": total_chunks
-            }
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                    continue
+                return {
+                    "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
+                    "public_total": 0.0, "service": "N/A", "carrier": "N/A", "error": str(e)[:200],
+                    "boxes": 0, "chunk_num": chunk_num, "total_chunks": total_chunks
+                }
+        
+        # All retries exhausted
+        return {
+            "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
+            "public_total": 0.0, "service": "N/A", "carrier": "N/A", "error": "All retries exhausted",
+            "boxes": 0, "chunk_num": chunk_num, "total_chunks": total_chunks
+        }
     finally:
         session.close()
 
@@ -293,7 +292,6 @@ def process_single_order(row, fallback_client_code, batch_id, dry_run=True, chun
             
             client_code_val = safe_string(row.get('client_code', fallback_client_code)) or fallback_client_code
             
-            # ✅ RETRY LOGIC BUILT INTO submit_chunk
             result = submit_chunk(payload, client_code_val, customer_order, batch_id, dry_run, chunk_num, num_chunks, max_retries=3)
             chunk_results.append(result)
         
@@ -400,7 +398,6 @@ def main():
         else:
             st.warning("⏸️ **Auto-Continue OFF**")
         
-        # ✅ INCREASED DELAY FOR RATE LIMITING
         delay_seconds = st.slider("⏱️ Delay Between Orders (seconds)", 3, 30, 10,
                                   help="Higher = more stable for 40,000 orders")
         
@@ -486,7 +483,7 @@ def main():
             last = st.session_state.all_results[-1]
             st.info(f"📦 Last: {last.get('OrderID', 'N/A')} - {last.get('City')}, {last.get('Province')} - {last.get('Cost')} - {last.get('Status')}")
         
-        # ✅ RATE LIMIT WARNING
+        # RATE LIMIT WARNING
         if st.session_state.consecutive_500_errors >= 5:
             st.error(f"⚠️ **{st.session_state.consecutive_500_errors} consecutive HTTP 500 errors.** TechSHIP API may be overloaded. Consider:")
             st.write("1. Increase delay between orders (sidebar)")
