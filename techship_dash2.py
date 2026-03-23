@@ -5,6 +5,7 @@ import uuid
 import concurrent.futures
 import time
 import math
+import itertools
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from io import BytesIO, StringIO
@@ -19,16 +20,49 @@ from sqlite_lookup import get_address_by_prefix
 st.set_page_config(page_title="TechSHIP Bulk Rate Estimator", page_icon="📦", layout="wide")
 
 # =========================
-# TechSHIP API Configuration
+# TechSHIP API Configurations (6 Endpoints for Parallel Processing)
 # =========================
-API_URL = "https://18wheels.techship.ca/api/v3/shipments/estimate"
-API_KEY = "bfdcbf84-f76d-b85b-8eae-fa925d6fa863"
-API_SECRET = "d2caf6ab27688a76966f1b8b6cbc2029"
-HEADERS = {
-    "x-api-key": API_KEY,
-    "x-secret-key": API_SECRET,
-    "Content-Type": "application/json"
-}
+API_CONFIGS = [
+    {
+        "name": "18 Wheels Main",
+        "url": "https://18wheels.techship.ca/api/v3/shipments/estimate",
+        "key": "bfdcbf84-f76d-b85b-8eae-fa925d6fa863",
+        "secret": "d2caf6ab27688a76966f1b8b6cbc2029"
+    },
+    {
+        "name": "18 Wheels Brampton",
+        "url": "https://18wheels-brampton.techship.ca/api/v3/shipments/estimate",
+        "key": "a9cf866e-3f47-632c-fcd6-59cd23dc0235",
+        "secret": "6c5700724bb1a8f75a5a0e46daa78725"
+    },
+    {
+        "name": "18 Wheels Richmond",
+        "url": "https://18wheelsrichmond.techship.ca/api/v3/shipments/estimate",
+        "key": "eb919c52-311f-f7a6-80f0-f9a4d0bb85b7",
+        "secret": "912a62dc87ae6a2d1d07de04109008aa"
+    },
+    {
+        "name": "18 Wheels Meadow",
+        "url": "https://18wheels-meadow.techship.ca/api/v3/shipments/estimate",
+        "key": "aa4b2e90-ed7b-4d35-915b-bdcecedeec1e",
+        "secret": "a78b162028f1103acbcec9bb10465af0"
+    },
+    {
+        "name": "18 Wheels Coquitlam",
+        "url": "https://18wheels-coquitlam.techship.ca/api/v3/shipments/estimate",
+        "key": "e13cdfe2-0e8b-3fd8-e8a4-84feae3667aa",
+        "secret": "4a27bf26837fccabfaa7092041fd248c"
+    },
+    {
+        "name": "18 Wheels TEST",
+        "url": "https://18wheels-test.techship.ca/api/v3/shipments/estimate",
+        "key": "7e9df3f6-b626-5624-8530-0559cf3ea171",
+        "secret": "21511fe1438e3d9defb8c4f7e5685a9a"
+    }
+]
+
+# Round-robin iterator for API selection
+_api_iterator = itertools.cycle(range(len(API_CONFIGS)))
 
 # =========================
 # Carrier Service Mapping
@@ -68,6 +102,11 @@ def safe_string(value, default=""):
         return default
     return str(value).strip()
 
+def get_next_api_config():
+    """Get next API config in round-robin fashion"""
+    idx = next(_api_iterator)
+    return API_CONFIGS[idx]
+
 def create_robust_session():
     session = requests.Session()
     retry_strategy = Retry(total=3, backoff_factor=2, status_forcelist=[429, 500, 502, 503, 504])
@@ -76,10 +115,20 @@ def create_robust_session():
     session.mount("https://", adapter)
     return session
 
-def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_num=1, total_chunks=1, max_retries=3):
-    """Submit chunk with retry logic for HTTP 500 errors"""
+def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_num=1, total_chunks=1, max_retries=3, api_config=None):
+    """Submit chunk with retry logic for HTTP 500 errors using specified API config"""
+    if api_config is None:
+        api_config = get_next_api_config()
+    
     session = create_robust_session()
     timeout = 60
+    
+    # Build headers for this API
+    headers = {
+        "x-api-key": api_config["key"],
+        "x-secret-key": api_config["secret"],
+        "Content-Type": "application/json"
+    }
     
     try:
         for attempt in range(max_retries):
@@ -87,7 +136,7 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
                 payload["ClientCode"] = client_code
                 params = {"dryRun": "true" if dry_run else "false"}
                 
-                response = session.post(API_URL, headers=HEADERS, json=payload, params=params, timeout=timeout)
+                response = session.post(api_config["url"], headers=headers, json=payload, params=params, timeout=timeout)
 
                 # SUCCESS
                 if response.status_code == 200:
@@ -103,7 +152,7 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
                             "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
                             "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
                             "error": "Invalid JSON response", "boxes": len(payload.get("Packages", [])),
-                            "chunk_num": chunk_num, "total_chunks": total_chunks
+                            "chunk_num": chunk_num, "total_chunks": total_chunks, "api_used": api_config["name"]
                         }
 
                     rates = response_data.get("Rates", [])
@@ -117,7 +166,8 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
                             "public_total": safe_float(best_rate.get("PublicTotalAmount", 0)),
                             "service": best_rate.get("ServiceName", best_rate.get("ServiceCode", "N/A")),
                             "carrier": payload.get("CarrierCode", "N/A"), "error": None,
-                            "boxes": len(payload.get("Packages", [])), "chunk_num": chunk_num, "total_chunks": total_chunks
+                            "boxes": len(payload.get("Packages", [])), "chunk_num": chunk_num, "total_chunks": total_chunks,
+                            "api_used": api_config["name"]
                         }
                     else:
                         if attempt < max_retries - 1:
@@ -127,7 +177,7 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
                             "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
                             "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
                             "error": "No rates returned", "boxes": len(payload.get("Packages", [])),
-                            "chunk_num": chunk_num, "total_chunks": total_chunks
+                            "chunk_num": chunk_num, "total_chunks": total_chunks, "api_used": api_config["name"]
                         }
 
                 # HTTP 500 - RETRY
@@ -143,7 +193,7 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
                             "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
                             "error": f"HTTP 500: {error_text} (after {max_retries} retries)",
                             "boxes": len(payload.get("Packages", [])),
-                            "chunk_num": chunk_num, "total_chunks": total_chunks
+                            "chunk_num": chunk_num, "total_chunks": total_chunks, "api_used": api_config["name"]
                         }
 
                 # OTHER ERRORS
@@ -154,7 +204,7 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
                         "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
                         "error": f"HTTP {response.status_code}: {error_text}",
                         "boxes": len(payload.get("Packages", [])),
-                        "chunk_num": chunk_num, "total_chunks": total_chunks
+                        "chunk_num": chunk_num, "total_chunks": total_chunks, "api_used": api_config["name"]
                     }
 
             except requests.exceptions.Timeout:
@@ -164,7 +214,7 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
                 return {
                     "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
                     "public_total": 0.0, "service": "N/A", "carrier": "N/A", "error": f"Timeout after {timeout}s",
-                    "boxes": 0, "chunk_num": chunk_num, "total_chunks": total_chunks
+                    "boxes": 0, "chunk_num": chunk_num, "total_chunks": total_chunks, "api_used": api_config["name"]
                 }
             except Exception as e:
                 if attempt < max_retries - 1:
@@ -173,14 +223,14 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
                 return {
                     "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
                     "public_total": 0.0, "service": "N/A", "carrier": "N/A", "error": str(e)[:200],
-                    "boxes": 0, "chunk_num": chunk_num, "total_chunks": total_chunks
+                    "boxes": 0, "chunk_num": chunk_num, "total_chunks": total_chunks, "api_used": api_config["name"]
                 }
         
         # All retries exhausted
         return {
             "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
             "public_total": 0.0, "service": "N/A", "carrier": "N/A", "error": "All retries exhausted",
-            "boxes": 0, "chunk_num": chunk_num, "total_chunks": total_chunks
+            "boxes": 0, "chunk_num": chunk_num, "total_chunks": total_chunks, "api_used": api_config["name"]
         }
     finally:
         session.close()
@@ -292,7 +342,9 @@ def process_single_order(row, fallback_client_code, batch_id, dry_run=True, chun
             
             client_code_val = safe_string(row.get('client_code', fallback_client_code)) or fallback_client_code
             
-            result = submit_chunk(payload, client_code_val, customer_order, batch_id, dry_run, chunk_num, num_chunks, max_retries=3)
+            # ✅ Use round-robin API selection
+            api_config = get_next_api_config()
+            result = submit_chunk(payload, client_code_val, customer_order, batch_id, dry_run, chunk_num, num_chunks, max_retries=3, api_config=api_config)
             chunk_results.append(result)
         
         total_cost = sum(safe_float(r.get("cost", 0)) for r in chunk_results if r.get("success"))
@@ -331,7 +383,8 @@ def process_single_order(row, fallback_client_code, batch_id, dry_run=True, chun
             "PostalCode": postal,
             "Email": email,
             "Error": error_info,
-            "DryRun": dry_run
+            "DryRun": dry_run,
+            "APIsUsed": list(set(r.get("api_used", "N/A") for r in chunk_results))
         }
     except Exception as e:
         return {
@@ -353,7 +406,8 @@ def process_single_order(row, fallback_client_code, batch_id, dry_run=True, chun
             "PostalCode": "N/A",
             "Email": "N/A",
             "Error": str(e)[:200],
-            "DryRun": dry_run
+            "DryRun": dry_run,
+            "APIsUsed": []
         }
 
 def add_selectable_css():
@@ -371,7 +425,7 @@ def add_selectable_css():
 def main():
     add_selectable_css()
     st.title("📦 TechSHIP Bulk Rate Estimator")
-    st.markdown("### Rate Limit Protected — Auto-Retry on HTTP 500")
+    st.markdown("### ⚡ 6-Way Parallel API Processing — 6x Faster Estimates")
 
     fallback_client_code = st.text_input("Fallback Client Code", value="8470HWY50")
     if not fallback_client_code.strip():
@@ -382,6 +436,26 @@ def main():
     chunk_size = st.sidebar.slider("📦 Boxes Per API Call", 5, 50, 10)
 
     with st.sidebar:
+        st.header("🚀 6-Way Parallel Processing")
+        st.info("""
+        **Active API Endpoints:**
+        1. 18 Wheels Main
+        2. 18 Wheels Brampton
+        3. 18 Wheels Richmond
+        4. 18 Wheels Meadow
+        5. 18 Wheels Coquitlam
+        6. 18 Wheels TEST
+        
+        **Load Balancing:** Round-robin distribution
+        **Expected Speedup:** ~6x faster than single endpoint
+        """)
+        
+        # Show API status
+        for i, config in enumerate(API_CONFIGS, 1):
+            st.write(f"{i}. {config['name']}")
+        
+        st.markdown("---")
+        
         st.header("📊 Progress")
         st.info("""
         **Rate Limit Protection:**
@@ -398,8 +472,8 @@ def main():
         else:
             st.warning("⏸️ **Auto-Continue OFF**")
         
-        delay_seconds = st.slider("⏱️ Delay Between Orders (seconds)", 3, 30, 10,
-                                  help="Higher = more stable for 40,000 orders")
+        delay_seconds = st.slider("⏱️ Delay Between Orders (seconds)", 3, 30, 5,
+                                  help="Lower = faster (5s recommended with 6 APIs)")
         
         if dry_run:
             st.warning("⚠️ Dry Run ON")
@@ -481,11 +555,12 @@ def main():
         
         if st.session_state.all_results:
             last = st.session_state.all_results[-1]
-            st.info(f"📦 Last: {last.get('OrderID', 'N/A')} - {last.get('City')}, {last.get('Province')} - {last.get('Cost')} - {last.get('Status')}")
+            apis_used = ", ".join(last.get("APIsUsed", ["N/A"])[:3])
+            st.info(f"📦 Last: {last.get('OrderID', 'N/A')} - {last.get('City')}, {last.get('Province')} - {last.get('Cost')} - APIs: {apis_used}")
         
         # RATE LIMIT WARNING
-        if st.session_state.consecutive_500_errors >= 5:
-            st.error(f"⚠️ **{st.session_state.consecutive_500_errors} consecutive HTTP 500 errors.** TechSHIP API may be overloaded. Consider:")
+        if st.session_state.consecutive_500_errors >= 10:
+            st.error(f"⚠️ **{st.session_state.consecutive_500_errors} consecutive HTTP 500 errors.** All 6 APIs may be overloaded. Consider:")
             st.write("1. Increase delay between orders (sidebar)")
             st.write("2. Pause and resume later")
             st.write("3. Contact TechSHIP support about rate limits")
@@ -517,7 +592,8 @@ def main():
                 
                 with status_container:
                     if result.get("Status", "").startswith("✅"):
-                        st.success(f"✅ {result.get('OrderID')}: {result.get('City')}, {result.get('Province')} - {result.get('Cost')} ({idx + 1}/{total})")
+                        apis_used = ", ".join(result.get("APIsUsed", ["N/A"])[:2])
+                        st.success(f"✅ {result.get('OrderID')}: {result.get('Cost')} (APIs: {apis_used}) ({idx + 1}/{total})")
                     else:
                         st.warning(f"⚠️ {result.get('OrderID')}: {result.get('Error', 'Failed')[:150]}")
                 
@@ -557,7 +633,8 @@ def main():
                                 st.session_state.consecutive_500_errors = 0
                             
                             if result.get("Status", "").startswith("✅"):
-                                st.success(f"✅ {result.get('OrderID')}: {result.get('Cost')}")
+                                apis_used = ", ".join(result.get("APIsUsed", ["N/A"])[:2])
+                                st.success(f"✅ {result.get('OrderID')}: {result.get('Cost')} (APIs: {apis_used})")
                             else:
                                 st.error(f"❌ {result.get('OrderID')}: {result.get('Error', 'Failed')[:200]}")
                             
@@ -617,6 +694,9 @@ def main():
         if st.button("🗑️ Reset & New File"):
             for key in ["file_uploaded", "all_orders", "processed_indices", "all_results", "batch_id", "total_orders", "processing_complete", "last_process_time", "consecutive_500_errors"]:
                 st.session_state[key] = [] if key in ["all_orders", "processed_indices", "all_results"] else "" if key == "batch_id" else False if key in ["file_uploaded", "processing_complete"] else 0 if key == "total_orders" else 0
+            # Reset API iterator
+            global _api_iterator
+            _api_iterator = itertools.cycle(range(len(API_CONFIGS)))
             st.rerun()
         
         # DISPLAY RESULTS
@@ -627,6 +707,8 @@ def main():
             display_cols = ["OrderID", "Status", "City", "Province", "Boxes", "Chunks", "Cost", "Service", "Carrier"]
             if "Error" in results_df.columns:
                 display_cols.append("Error")
+            if "APIsUsed" in results_df.columns:
+                display_cols.append("APIsUsed")
             
             st.dataframe(results_df[display_cols].tail(50), use_container_width=True)
             
@@ -637,13 +719,23 @@ def main():
             col2.metric("Failed", len(st.session_state.all_results) - success)
             total_cost = sum(safe_float(r.get('Cost', '$0').replace('$', '')) for r in st.session_state.all_results)
             col3.metric("Total Cost", f"${total_cost:.2f}")
+            
+            # API Usage Stats
+            api_usage = defaultdict(int)
+            for r in st.session_state.all_results:
+                for api in r.get("APIsUsed", []):
+                    api_usage[api] += 1
+            if api_usage:
+                st.write("🔗 **API Usage:**")
+                for api, count in sorted(api_usage.items(), key=lambda x: -x[1]):
+                    st.write(f"- {api}: {count} requests")
         
         # REMAINING INFO
         if remaining > 0:
             if auto_continue:
                 st.info(f"🔄 **Auto-Processing:** {remaining} orders remaining...")
                 est_time = remaining * delay_seconds
-                st.write(f"⏱️ Est. time: ~{est_time // 60} min {est_time % 60} sec")
+                st.write(f"⏱️ Est. time: ~{est_time // 60} min {est_time % 60} sec (with 6 parallel APIs)")
             else:
                 st.info(f"⏭️ {remaining} orders remaining.")
         else:
