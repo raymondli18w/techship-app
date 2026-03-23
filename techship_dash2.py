@@ -6,6 +6,7 @@ import concurrent.futures
 import time
 import math
 import itertools
+import json
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from io import BytesIO, StringIO
@@ -115,125 +116,139 @@ def create_robust_session():
     session.mount("https://", adapter)
     return session
 
-def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_num=1, total_chunks=1, max_retries=3, api_config=None):
-    """Submit chunk with retry logic for HTTP 500 errors using specified API config"""
+def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_num=1, total_chunks=1, max_retries=3, api_config=None, max_api_fallbacks=6):
+    """Submit chunk with retry logic + API fallback for client not found errors"""
     if api_config is None:
         api_config = get_next_api_config()
     
-    session = create_robust_session()
     timeout = 60
     
-    # Build headers for this API
-    headers = {
-        "x-api-key": api_config["key"],
-        "x-secret-key": api_config["secret"],
-        "Content-Type": "application/json"
-    }
-    
-    try:
-        for attempt in range(max_retries):
-            try:
-                payload["ClientCode"] = client_code
-                params = {"dryRun": "true" if dry_run else "false"}
-                
-                response = session.post(api_config["url"], headers=headers, json=payload, params=params, timeout=timeout)
+    # Try multiple API endpoints if client not found
+    for api_attempt in range(max_api_fallbacks):
+        current_api = API_CONFIGS[(API_CONFIGS.index(api_config) + api_attempt) % len(API_CONFIGS)]
+        
+        session = create_robust_session()
+        headers = {
+            "x-api-key": current_api["key"],
+            "x-secret-key": current_api["secret"],
+            "Content-Type": "application/json"
+        }
+        
+        try:
+            for attempt in range(max_retries):
+                try:
+                    payload["ClientCode"] = client_code
+                    params = {"dryRun": "true" if dry_run else "false"}
+                    
+                    response = session.post(current_api["url"], headers=headers, json=payload, params=params, timeout=timeout)
 
-                # SUCCESS
-                if response.status_code == 200:
-                    try:
-                        response_data = response.json()
-                        if not isinstance(response_data, dict):
-                            response_data = {}
-                    except Exception:
+                    # ✅ SUCCESS
+                    if response.status_code == 200:
+                        try:
+                            response_data = response.json()
+                            if not isinstance(response_data, dict):
+                                response_data = {}
+                        except Exception:
+                            if attempt < max_retries - 1:
+                                time.sleep(2 ** attempt)
+                                continue
+                            return {
+                                "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
+                                "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
+                                "error": "Invalid JSON response", "boxes": len(payload.get("Packages", [])),
+                                "chunk_num": chunk_num, "total_chunks": total_chunks, "api_used": current_api["name"]
+                            }
+
+                        rates = response_data.get("Rates", [])
+                        if rates and len(rates) > 0:
+                            best_rate = next((r for r in rates if r.get("IsBest")), rates[0])
+                            return {
+                                "success": True,
+                                "cost": safe_float(best_rate.get("TotalAmount", best_rate.get("Amount", 0))),
+                                "base_amount": safe_float(best_rate.get("BaseAmount", 0)),
+                                "fuel_surcharge": safe_float(best_rate.get("FuelSurcharge", 0)),
+                                "public_total": safe_float(best_rate.get("PublicTotalAmount", 0)),
+                                "service": best_rate.get("ServiceName", best_rate.get("ServiceCode", "N/A")),
+                                "carrier": payload.get("CarrierCode", "N/A"), "error": None,
+                                "boxes": len(payload.get("Packages", [])), "chunk_num": chunk_num, "total_chunks": total_chunks,
+                                "api_used": current_api["name"]
+                            }
+                        else:
+                            if attempt < max_retries - 1:
+                                time.sleep(2 ** attempt)
+                                continue
+                            return {
+                                "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
+                                "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
+                                "error": "No rates returned", "boxes": len(payload.get("Packages", [])),
+                                "chunk_num": chunk_num, "total_chunks": total_chunks, "api_used": current_api["name"]
+                            }
+
+                    # ✅ HTTP 500 with Client Not Found - TRY NEXT API
+                    elif response.status_code == 500:
+                        error_text = response.text[:500] if response.text else ""
+                        try:
+                            error_json = json.loads(response.text)
+                            exception_msg = error_json.get("ExceptionMessage", "")
+                            if "is not found" in exception_msg or "Client" in exception_msg:
+                                # Client not found on this API - try next one
+                                if api_attempt < max_api_fallbacks - 1:
+                                    session.close()
+                                    continue  # Try next API endpoint
+                        except:
+                            pass
+                        
                         if attempt < max_retries - 1:
-                            time.sleep(2 ** attempt)
+                            wait_time = 2 ** attempt
+                            time.sleep(wait_time)
                             continue
-                        return {
-                            "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
-                            "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
-                            "error": "Invalid JSON response", "boxes": len(payload.get("Packages", [])),
-                            "chunk_num": chunk_num, "total_chunks": total_chunks, "api_used": api_config["name"]
-                        }
+                        else:
+                            return {
+                                "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
+                                "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
+                                "error": f"HTTP 500: {error_text[:200]} (after {max_retries} retries, {api_attempt + 1} APIs tried)",
+                                "boxes": len(payload.get("Packages", [])),
+                                "chunk_num": chunk_num, "total_chunks": total_chunks, "api_used": current_api["name"]
+                            }
 
-                    rates = response_data.get("Rates", [])
-                    if rates and len(rates) > 0:
-                        best_rate = next((r for r in rates if r.get("IsBest")), rates[0])
-                        return {
-                            "success": True,
-                            "cost": safe_float(best_rate.get("TotalAmount", best_rate.get("Amount", 0))),
-                            "base_amount": safe_float(best_rate.get("BaseAmount", 0)),
-                            "fuel_surcharge": safe_float(best_rate.get("FuelSurcharge", 0)),
-                            "public_total": safe_float(best_rate.get("PublicTotalAmount", 0)),
-                            "service": best_rate.get("ServiceName", best_rate.get("ServiceCode", "N/A")),
-                            "carrier": payload.get("CarrierCode", "N/A"), "error": None,
-                            "boxes": len(payload.get("Packages", [])), "chunk_num": chunk_num, "total_chunks": total_chunks,
-                            "api_used": api_config["name"]
-                        }
+                    # OTHER ERRORS
                     else:
-                        if attempt < max_retries - 1:
-                            time.sleep(2 ** attempt)
-                            continue
+                        error_text = response.text[:300] if response.text else "No details"
                         return {
                             "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
                             "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
-                            "error": "No rates returned", "boxes": len(payload.get("Packages", [])),
-                            "chunk_num": chunk_num, "total_chunks": total_chunks, "api_used": api_config["name"]
-                        }
-
-                # HTTP 500 - RETRY
-                elif response.status_code == 500:
-                    if attempt < max_retries - 1:
-                        wait_time = 2 ** attempt
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        error_text = response.text[:300] if response.text else "Server error"
-                        return {
-                            "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
-                            "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
-                            "error": f"HTTP 500: {error_text} (after {max_retries} retries)",
+                            "error": f"HTTP {response.status_code}: {error_text}",
                             "boxes": len(payload.get("Packages", [])),
-                            "chunk_num": chunk_num, "total_chunks": total_chunks, "api_used": api_config["name"]
+                            "chunk_num": chunk_num, "total_chunks": total_chunks, "api_used": current_api["name"]
                         }
 
-                # OTHER ERRORS
-                else:
-                    error_text = response.text[:300] if response.text else "No details"
+                except requests.exceptions.Timeout:
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)
+                        continue
                     return {
                         "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
-                        "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
-                        "error": f"HTTP {response.status_code}: {error_text}",
-                        "boxes": len(payload.get("Packages", [])),
-                        "chunk_num": chunk_num, "total_chunks": total_chunks, "api_used": api_config["name"]
+                        "public_total": 0.0, "service": "N/A", "carrier": "N/A", "error": f"Timeout after {timeout}s",
+                        "boxes": 0, "chunk_num": chunk_num, "total_chunks": total_chunks, "api_used": current_api["name"]
                     }
-
-            except requests.exceptions.Timeout:
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)
-                    continue
-                return {
-                    "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
-                    "public_total": 0.0, "service": "N/A", "carrier": "N/A", "error": f"Timeout after {timeout}s",
-                    "boxes": 0, "chunk_num": chunk_num, "total_chunks": total_chunks, "api_used": api_config["name"]
-                }
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)
-                    continue
-                return {
-                    "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
-                    "public_total": 0.0, "service": "N/A", "carrier": "N/A", "error": str(e)[:200],
-                    "boxes": 0, "chunk_num": chunk_num, "total_chunks": total_chunks, "api_used": api_config["name"]
-                }
-        
-        # All retries exhausted
-        return {
-            "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
-            "public_total": 0.0, "service": "N/A", "carrier": "N/A", "error": "All retries exhausted",
-            "boxes": 0, "chunk_num": chunk_num, "total_chunks": total_chunks, "api_used": api_config["name"]
-        }
-    finally:
-        session.close()
+                except Exception as e:
+                    if attempt < max_retries - 1:
+                        time.sleep(2 ** attempt)
+                        continue
+                    return {
+                        "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
+                        "public_total": 0.0, "service": "N/A", "carrier": "N/A", "error": str(e)[:200],
+                        "boxes": 0, "chunk_num": chunk_num, "total_chunks": total_chunks, "api_used": current_api["name"]
+                    }
+        finally:
+            session.close()
+    
+    # All APIs exhausted
+    return {
+        "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
+        "public_total": 0.0, "service": "N/A", "carrier": "N/A", "error": f"Client {client_code} not found on any API endpoint",
+        "boxes": 0, "chunk_num": chunk_num, "total_chunks": total_chunks, "api_used": "All APIs"
+    }
 
 def process_single_order(row, fallback_client_code, batch_id, dry_run=True, chunk_size=10):
     """Process a single order with automatic splitting for large box counts"""
@@ -342,7 +357,7 @@ def process_single_order(row, fallback_client_code, batch_id, dry_run=True, chun
             
             client_code_val = safe_string(row.get('client_code', fallback_client_code)) or fallback_client_code
             
-            # ✅ Use round-robin API selection
+            # Use round-robin API selection with fallback
             api_config = get_next_api_config()
             result = submit_chunk(payload, client_code_val, customer_order, batch_id, dry_run, chunk_num, num_chunks, max_retries=3, api_config=api_config)
             chunk_results.append(result)
@@ -425,7 +440,7 @@ def add_selectable_css():
 def main():
     add_selectable_css()
     st.title("📦 TechSHIP Bulk Rate Estimator")
-    st.markdown("### ⚡ 6-Way Parallel API Processing — 6x Faster Estimates")
+    st.markdown("### ⚡ True 6-Way Parallel Processing — API Fallback Enabled")
 
     fallback_client_code = st.text_input("Fallback Client Code", value="8470HWY50")
     if not fallback_client_code.strip():
@@ -436,17 +451,22 @@ def main():
     chunk_size = st.sidebar.slider("📦 Boxes Per API Call", 5, 50, 10)
 
     with st.sidebar:
-        st.header("🚀 6-Way Parallel Processing")
+        st.header("🚀 True 6-Way Parallel Processing")
         st.info("""
         **Active API Endpoints:**
         1. 18 Wheels Main
-        2. 18 Wheels Brampton
+        2. 18 Wheels Brampton  
         3. 18 Wheels Richmond
         4. 18 Wheels Meadow
         5. 18 Wheels Coquitlam
         6. 18 Wheels TEST
         
-        **Load Balancing:** Round-robin distribution
+        **Features:**
+        - ✅ True parallel processing (6 orders simultaneously)
+        - ✅ API fallback: if client not found, try next endpoint
+        - ✅ Round-robin load balancing
+        - ✅ Auto-retry on HTTP 500
+        
         **Expected Speedup:** ~6x faster than single endpoint
         """)
         
@@ -457,13 +477,9 @@ def main():
         st.markdown("---")
         
         st.header("📊 Progress")
-        st.info("""
-        **Rate Limit Protection:**
-        1. Auto-retry on HTTP 500 (3 attempts)
-        2. Exponential backoff (2s, 4s, 8s)
-        3. Single worker to prevent overload
-        4. Longer delay between orders
-        """)
+        
+        parallel_workers = st.slider("🔢 Parallel Workers (1-6)", 1, 6, 6,
+                                     help="Number of orders to process simultaneously")
         
         auto_continue = st.checkbox("🔄 Auto-Continue Mode", value=False)
         
@@ -472,8 +488,8 @@ def main():
         else:
             st.warning("⏸️ **Auto-Continue OFF**")
         
-        delay_seconds = st.slider("⏱️ Delay Between Orders (seconds)", 3, 30, 5,
-                                  help="Lower = faster (5s recommended with 6 APIs)")
+        delay_seconds = st.slider("⏱️ Delay Between Batches (seconds)", 1, 10, 2,
+                                  help="Delay between batches of parallel orders")
         
         if dry_run:
             st.warning("⚠️ Dry Run ON")
@@ -561,41 +577,58 @@ def main():
         # RATE LIMIT WARNING
         if st.session_state.consecutive_500_errors >= 10:
             st.error(f"⚠️ **{st.session_state.consecutive_500_errors} consecutive HTTP 500 errors.** All 6 APIs may be overloaded. Consider:")
-            st.write("1. Increase delay between orders (sidebar)")
-            st.write("2. Pause and resume later")
+            st.write("1. Increase delay between batches (sidebar)")
+            st.write("2. Reduce parallel workers")
             st.write("3. Contact TechSHIP support about rate limits")
         
-        # AUTO-CONTINUE LOGIC
+        # ✅ TRUE PARALLEL PROCESSING WITH AUTO-CONTINUE
         if auto_continue and remaining > 0 and not st.session_state.processing_complete:
             current_time = time.time()
             time_since_last = current_time - st.session_state.last_process_time
             
             if time_since_last >= delay_seconds or st.session_state.last_process_time == 0:
-                idx = processed
-                row = st.session_state.all_orders[idx]
+                # Get next batch of orders to process in parallel
+                batch_size = parallel_workers
+                start_idx = processed
+                end_idx = min(start_idx + batch_size, total)
+                batch_indices = list(range(start_idx, end_idx))
                 
                 status_container = st.empty()
                 with status_container:
-                    st.info(f"⏳ Processing order {idx + 1} of {total}...")
+                    st.info(f"⏳ Processing {len(batch_indices)} orders in parallel ({start_idx + 1}-{end_idx} of {total})...")
                 
-                result = process_single_order(row, fallback_client_code.strip(), st.session_state.batch_id, dry_run, chunk_size)
+                # Process orders in parallel using ThreadPoolExecutor
+                batch_results = []
+                with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+                    futures = []
+                    for idx in batch_indices:
+                        row = st.session_state.all_orders[idx]
+                        future = executor.submit(process_single_order, row, fallback_client_code.strip(), 
+                                               st.session_state.batch_id, dry_run, chunk_size)
+                        futures.append((idx, future))
+                    
+                    # Collect results as they complete
+                    for idx, future in futures:
+                        result = future.result()
+                        batch_results.append((idx, result))
                 
-                st.session_state.all_results.append(result)
-                st.session_state.processed_indices.append(idx)
+                # Sort results by original index and add to session state
+                batch_results.sort(key=lambda x: x[0])
+                for idx, result in batch_results:
+                    st.session_state.all_results.append(result)
+                    st.session_state.processed_indices.append(idx)
+                    
+                    # Track consecutive 500 errors
+                    if "HTTP 500" in result.get("Error", ""):
+                        st.session_state.consecutive_500_errors += 1
+                    else:
+                        st.session_state.consecutive_500_errors = 0
+                
                 st.session_state.last_process_time = time.time()
                 
-                # Track consecutive 500 errors
-                if "HTTP 500" in result.get("Error", ""):
-                    st.session_state.consecutive_500_errors += 1
-                else:
-                    st.session_state.consecutive_500_errors = 0
-                
                 with status_container:
-                    if result.get("Status", "").startswith("✅"):
-                        apis_used = ", ".join(result.get("APIsUsed", ["N/A"])[:2])
-                        st.success(f"✅ {result.get('OrderID')}: {result.get('Cost')} (APIs: {apis_used}) ({idx + 1}/{total})")
-                    else:
-                        st.warning(f"⚠️ {result.get('OrderID')}: {result.get('Error', 'Failed')[:150]}")
+                    success_count = sum(1 for _, r in batch_results if r.get("Status", "").startswith("✅"))
+                    st.success(f"✅ Batch complete: {success_count}/{len(batch_results)} successful. Total: {len(st.session_state.processed_indices)}/{total}")
                 
                 if len(st.session_state.processed_indices) >= total:
                     st.session_state.processing_complete = True
@@ -607,17 +640,62 @@ def main():
                     st.rerun()
             else:
                 countdown = int(delay_seconds - time_since_last)
-                st.info(f"⏱️ Next order in {countdown} seconds... ({processed + 1}/{total})")
+                st.info(f"⏱️ Next batch in {countdown} seconds... ({processed + 1}/{total})")
                 time.sleep(1)
                 st.rerun()
         
-        # MANUAL BUTTONS
+        # ✅ MANUAL PARALLEL PROCESSING BUTTONS
         if not auto_continue or st.session_state.processing_complete:
             col1, col2, col3, col4 = st.columns(4)
             
             with col1:
                 if remaining > 0 and not st.session_state.processing_complete:
-                    if st.button("▶️ Process 1 Order", type="primary" if not auto_continue else "secondary", use_container_width=True):
+                    if st.button(f"▶️ Process {parallel_workers} Orders", type="primary" if not auto_continue else "secondary", use_container_width=True):
+                        batch_size = parallel_workers
+                        start_idx = processed
+                        end_idx = min(start_idx + batch_size, total)
+                        batch_indices = list(range(start_idx, end_idx))
+                        
+                        status_container = st.empty()
+                        with status_container:
+                            st.info(f"⏳ Processing {len(batch_indices)} orders in parallel...")
+                        
+                        batch_results = []
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+                            futures = []
+                            for idx in batch_indices:
+                                row = st.session_state.all_orders[idx]
+                                future = executor.submit(process_single_order, row, fallback_client_code.strip(), 
+                                                       st.session_state.batch_id, dry_run, chunk_size)
+                                futures.append((idx, future))
+                            
+                            for idx, future in futures:
+                                result = future.result()
+                                batch_results.append((idx, result))
+                        
+                        batch_results.sort(key=lambda x: x[0])
+                        for idx, result in batch_results:
+                            st.session_state.all_results.append(result)
+                            st.session_state.processed_indices.append(idx)
+                            
+                            if "HTTP 500" in result.get("Error", ""):
+                                st.session_state.consecutive_500_errors += 1
+                            else:
+                                st.session_state.consecutive_500_errors = 0
+                        
+                        with status_container:
+                            success_count = sum(1 for _, r in batch_results if r.get("Status", "").startswith("✅"))
+                            st.success(f"✅ {success_count}/{len(batch_results)} successful")
+                        
+                        if len(st.session_state.processed_indices) >= total:
+                            st.session_state.processing_complete = True
+                            st.balloons()
+                        
+                        st.rerun()
+            
+            with col2:
+                if remaining > 0 and not st.session_state.processing_complete:
+                    if st.button("▶️ Process 1 Order", use_container_width=True):
                         idx = processed
                         row = st.session_state.all_orders[idx]
                         
@@ -637,30 +715,6 @@ def main():
                                 st.success(f"✅ {result.get('OrderID')}: {result.get('Cost')} (APIs: {apis_used})")
                             else:
                                 st.error(f"❌ {result.get('OrderID')}: {result.get('Error', 'Failed')[:200]}")
-                            
-                            if len(st.session_state.processed_indices) >= total:
-                                st.session_state.processing_complete = True
-                                st.balloons()
-                            
-                            st.rerun()
-            
-            with col2:
-                if remaining > 0 and not st.session_state.processing_complete:
-                    if st.button("▶️ Process 10 Orders", use_container_width=True):
-                        start_idx = processed
-                        end_idx = min(start_idx + 10, total)
-                        
-                        with st.spinner(f"⏳ Processing orders {start_idx + 1}-{end_idx}..."):
-                            for idx in range(start_idx, end_idx):
-                                row = st.session_state.all_orders[idx]
-                                result = process_single_order(row, fallback_client_code.strip(), st.session_state.batch_id, dry_run, chunk_size)
-                                st.session_state.all_results.append(result)
-                                st.session_state.processed_indices.append(idx)
-                                
-                                if "HTTP 500" in result.get("Error", ""):
-                                    st.session_state.consecutive_500_errors += 1
-                                else:
-                                    st.session_state.consecutive_500_errors = 0
                             
                             if len(st.session_state.processed_indices) >= total:
                                 st.session_state.processing_complete = True
@@ -733,9 +787,9 @@ def main():
         # REMAINING INFO
         if remaining > 0:
             if auto_continue:
-                st.info(f"🔄 **Auto-Processing:** {remaining} orders remaining...")
-                est_time = remaining * delay_seconds
-                st.write(f"⏱️ Est. time: ~{est_time // 60} min {est_time % 60} sec (with 6 parallel APIs)")
+                est_time = (remaining / parallel_workers) * delay_seconds
+                st.info(f"🔄 **Auto-Processing:** {remaining} orders remaining with {parallel_workers} parallel workers...")
+                st.write(f"⏱️ Est. time: ~{est_time // 60} min {est_time % 60} sec")
             else:
                 st.info(f"⏭️ {remaining} orders remaining.")
         else:
