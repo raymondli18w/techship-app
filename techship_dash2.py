@@ -618,8 +618,9 @@ def main():
                     st.session_state.all_results.append(result)
                     st.session_state.processed_indices.append(idx)
                     
-                    # Track consecutive 500 errors
-                    if "HTTP 500" in result.get("Error", ""):
+                    # Track consecutive 500 errors - FIXED: Convert None to string safely
+                    error_msg = result.get("Error", "")
+                    if error_msg and "HTTP 500" in str(error_msg):
                         st.session_state.consecutive_500_errors += 1
                     else:
                         st.session_state.consecutive_500_errors = 0
@@ -678,7 +679,9 @@ def main():
                             st.session_state.all_results.append(result)
                             st.session_state.processed_indices.append(idx)
                             
-                            if "HTTP 500" in result.get("Error", ""):
+                            # Track consecutive 500 errors - FIXED: Convert None to string safely
+                            error_msg = result.get("Error", "")
+                            if error_msg and "HTTP 500" in str(error_msg):
                                 st.session_state.consecutive_500_errors += 1
                             else:
                                 st.session_state.consecutive_500_errors = 0
@@ -705,7 +708,9 @@ def main():
                             st.session_state.all_results.append(result)
                             st.session_state.processed_indices.append(idx)
                             
-                            if "HTTP 500" in result.get("Error", ""):
+                            # Track consecutive 500 errors - FIXED: Convert None to string safely
+                            error_msg = result.get("Error", "")
+                            if error_msg and "HTTP 500" in str(error_msg):
                                 st.session_state.consecutive_500_errors += 1
                             else:
                                 st.session_state.consecutive_500_errors = 0
@@ -724,80 +729,4 @@ def main():
             
             with col3:
                 if st.button("🔄 Refresh", use_container_width=True):
-                    st.rerun()
-            
-            with col4:
-                if st.session_state.all_results:
-                    csv = pd.DataFrame(st.session_state.all_results).to_csv(index=False).encode('utf-8')
-                    st.download_button("💾 Download", csv, f"techship_{st.session_state.batch_id}.csv", "text/csv", use_container_width=True)
-        
-        # AUTO-CONTINUE CONTROLS
-        if auto_continue and remaining > 0 and not st.session_state.processing_complete:
-            st.divider()
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("⏸️ Pause Auto-Continue", type="secondary", use_container_width=True):
-                    auto_continue = False
-                    st.rerun()
-            with col2:
-                if st.button("💾 Download Progress Now", use_container_width=True):
-                    csv = pd.DataFrame(st.session_state.all_results).to_csv(index=False).encode('utf-8')
-                    st.download_button("💾 Download Partial Results", csv, f"techship_partial_{st.session_state.batch_id}.csv", "text/csv", use_container_width=True)
-        
-        # RESET BUTTON
-        if st.button("🗑️ Reset & New File"):
-            for key in ["file_uploaded", "all_orders", "processed_indices", "all_results", "batch_id", "total_orders", "processing_complete", "last_process_time", "consecutive_500_errors"]:
-                st.session_state[key] = [] if key in ["all_orders", "processed_indices", "all_results"] else "" if key == "batch_id" else False if key in ["file_uploaded", "processing_complete"] else 0 if key == "total_orders" else 0
-            # Reset API iterator
-            global _api_iterator
-            _api_iterator = itertools.cycle(range(len(API_CONFIGS)))
-            st.rerun()
-        
-        # DISPLAY RESULTS
-        if st.session_state.all_results:
-            st.subheader(f"📊 Results ({len(st.session_state.all_results)} orders)")
-            
-            results_df = pd.DataFrame(st.session_state.all_results)
-            display_cols = ["OrderID", "Status", "City", "Province", "Boxes", "Chunks", "Cost", "Service", "Carrier"]
-            if "Error" in results_df.columns:
-                display_cols.append("Error")
-            if "APIsUsed" in results_df.columns:
-                display_cols.append("APIsUsed")
-            
-            st.dataframe(results_df[display_cols].tail(50), use_container_width=True)
-            
-            # Stats
-            col1, col2, col3 = st.columns(3)
-            success = sum(1 for r in st.session_state.all_results if "✅" in r.get("Status", ""))
-            col1.metric("Successful", success)
-            col2.metric("Failed", len(st.session_state.all_results) - success)
-            total_cost = sum(safe_float(r.get('Cost', '$0').replace('$', '')) for r in st.session_state.all_results)
-            col3.metric("Total Cost", f"${total_cost:.2f}")
-            
-            # API Usage Stats
-            api_usage = defaultdict(int)
-            for r in st.session_state.all_results:
-                for api in r.get("APIsUsed", []):
-                    api_usage[api] += 1
-            if api_usage:
-                st.write("🔗 **API Usage:**")
-                for api, count in sorted(api_usage.items(), key=lambda x: -x[1]):
-                    st.write(f"- {api}: {count} requests")
-        
-        # REMAINING INFO
-        if remaining > 0:
-            if auto_continue:
-                est_time = (remaining / parallel_workers) * delay_seconds
-                st.info(f"🔄 **Auto-Processing:** {remaining} orders remaining with {parallel_workers} parallel workers...")
-                st.write(f"⏱️ Est. time: ~{est_time // 60} min {est_time % 60} sec")
-            else:
-                st.info(f"⏭️ {remaining} orders remaining.")
-        else:
-            st.success("🎉 All orders processed!")
-            
-            if st.session_state.all_results:
-                csv = pd.DataFrame(st.session_state.all_results).to_csv(index=False).encode('utf-8')
-                st.download_button("💾 Download Final Report", csv, f"techship_FINAL_{st.session_state.batch_id}.csv", "text/csv", type="primary", use_container_width=True)
-
-if __name__ == "__main__":
-    main()
+                    st.rerun
