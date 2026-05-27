@@ -12,9 +12,6 @@ from urllib3.util.retry import Retry
 from io import BytesIO, StringIO
 from collections import defaultdict
 
-# SQLite Address Lookup
-from sqlite_lookup import get_address_by_prefix
-
 # =========================
 # MUST be the first Streamlit command
 # =========================
@@ -106,7 +103,7 @@ def safe_string(value, default=""):
 def get_next_api_config():
     """Get next API config in round-robin fashion"""
     idx = next(_api_iterator)
-    return API_CONFIGS[idx]
+    return API_CONFIGS[idx].copy()  # Return a copy to avoid reference issues
 
 def create_robust_session():
     session = requests.Session()
@@ -118,14 +115,24 @@ def create_robust_session():
 
 def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_num=1, total_chunks=1, max_retries=3, api_config=None, max_api_fallbacks=6):
     """Submit chunk with retry logic + API fallback for client not found errors"""
-    if api_config is None:
-        api_config = get_next_api_config()
-    
     timeout = 60
     
     # Try multiple API endpoints if client not found
     for api_attempt in range(max_api_fallbacks):
-        current_api = API_CONFIGS[(API_CONFIGS.index(api_config) + api_attempt) % len(API_CONFIGS)]
+        # Select API endpoint - if api_config provided, try it first, then cycle through others
+        if api_attempt == 0 and api_config is not None:
+            # Find the index of the provided api_config
+            try:
+                current_api_index = API_CONFIGS.index(api_config)
+            except (ValueError, IndexError):
+                current_api_index = next(_api_iterator)
+        else:
+            if api_attempt == 0:
+                current_api_index = next(_api_iterator)
+            else:
+                current_api_index = (current_api_index + 1) % len(API_CONFIGS)
+        
+        current_api = API_CONFIGS[current_api_index].copy()
         
         session = create_robust_session()
         headers = {
@@ -137,10 +144,11 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
         try:
             for attempt in range(max_retries):
                 try:
-                    payload["ClientCode"] = client_code
+                    payload_copy = payload.copy()
+                    payload_copy["ClientCode"] = client_code
                     params = {"dryRun": "true" if dry_run else "false"}
                     
-                    response = session.post(current_api["url"], headers=headers, json=payload, params=params, timeout=timeout)
+                    response = session.post(current_api["url"], headers=headers, json=payload_copy, params=params, timeout=timeout)
 
                     # ✅ SUCCESS
                     if response.status_code == 200:
@@ -154,8 +162,8 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
                                 continue
                             return {
                                 "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
-                                "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
-                                "error": "Invalid JSON response", "boxes": len(payload.get("Packages", [])),
+                                "public_total": 0.0, "service": "N/A", "carrier": payload_copy.get("CarrierCode", "N/A"),
+                                "error": "Invalid JSON response", "boxes": len(payload_copy.get("Packages", [])),
                                 "chunk_num": chunk_num, "total_chunks": total_chunks, "api_used": current_api["name"]
                             }
 
@@ -169,8 +177,8 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
                                 "fuel_surcharge": safe_float(best_rate.get("FuelSurcharge", 0)),
                                 "public_total": safe_float(best_rate.get("PublicTotalAmount", 0)),
                                 "service": best_rate.get("ServiceName", best_rate.get("ServiceCode", "N/A")),
-                                "carrier": payload.get("CarrierCode", "N/A"), "error": None,
-                                "boxes": len(payload.get("Packages", [])), "chunk_num": chunk_num, "total_chunks": total_chunks,
+                                "carrier": payload_copy.get("CarrierCode", "N/A"), "error": None,
+                                "boxes": len(payload_copy.get("Packages", [])), "chunk_num": chunk_num, "total_chunks": total_chunks,
                                 "api_used": current_api["name"]
                             }
                         else:
@@ -179,8 +187,8 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
                                 continue
                             return {
                                 "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
-                                "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
-                                "error": "No rates returned", "boxes": len(payload.get("Packages", [])),
+                                "public_total": 0.0, "service": "N/A", "carrier": payload_copy.get("CarrierCode", "N/A"),
+                                "error": "No rates returned", "boxes": len(payload_copy.get("Packages", [])),
                                 "chunk_num": chunk_num, "total_chunks": total_chunks, "api_used": current_api["name"]
                             }
 
@@ -194,7 +202,7 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
                                 # Client not found on this API - try next one
                                 if api_attempt < max_api_fallbacks - 1:
                                     session.close()
-                                    continue  # Try next API endpoint
+                                    break  # Break retry loop, go to next API
                         except:
                             pass
                         
@@ -205,9 +213,9 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
                         else:
                             return {
                                 "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
-                                "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
+                                "public_total": 0.0, "service": "N/A", "carrier": payload_copy.get("CarrierCode", "N/A"),
                                 "error": f"HTTP 500: {error_text[:200]} (after {max_retries} retries, {api_attempt + 1} APIs tried)",
-                                "boxes": len(payload.get("Packages", [])),
+                                "boxes": len(payload_copy.get("Packages", [])),
                                 "chunk_num": chunk_num, "total_chunks": total_chunks, "api_used": current_api["name"]
                             }
 
@@ -216,9 +224,9 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
                         error_text = response.text[:300] if response.text else "No details"
                         return {
                             "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
-                            "public_total": 0.0, "service": "N/A", "carrier": payload.get("CarrierCode", "N/A"),
+                            "public_total": 0.0, "service": "N/A", "carrier": payload_copy.get("CarrierCode", "N/A"),
                             "error": f"HTTP {response.status_code}: {error_text}",
-                            "boxes": len(payload.get("Packages", [])),
+                            "boxes": len(payload_copy.get("Packages", [])),
                             "chunk_num": chunk_num, "total_chunks": total_chunks, "api_used": current_api["name"]
                         }
 
@@ -618,7 +626,7 @@ def main():
                     st.session_state.all_results.append(result)
                     st.session_state.processed_indices.append(idx)
                     
-                    # Track consecutive 500 errors - FIXED: Convert None to string safely
+                    # Track consecutive 500 errors
                     error_msg = result.get("Error", "")
                     if error_msg and "HTTP 500" in str(error_msg):
                         st.session_state.consecutive_500_errors += 1
@@ -679,7 +687,7 @@ def main():
                             st.session_state.all_results.append(result)
                             st.session_state.processed_indices.append(idx)
                             
-                            # Track consecutive 500 errors - FIXED: Convert None to string safely
+                            # Track consecutive 500 errors
                             error_msg = result.get("Error", "")
                             if error_msg and "HTTP 500" in str(error_msg):
                                 st.session_state.consecutive_500_errors += 1
@@ -708,7 +716,7 @@ def main():
                             st.session_state.all_results.append(result)
                             st.session_state.processed_indices.append(idx)
                             
-                            # Track consecutive 500 errors - FIXED: Convert None to string safely
+                            # Track consecutive 500 errors
                             error_msg = result.get("Error", "")
                             if error_msg and "HTTP 500" in str(error_msg):
                                 st.session_state.consecutive_500_errors += 1
@@ -716,17 +724,4 @@ def main():
                                 st.session_state.consecutive_500_errors = 0
                             
                             if result.get("Status", "").startswith("✅"):
-                                apis_used = ", ".join(result.get("APIsUsed", ["N/A"])[:2])
-                                st.success(f"✅ {result.get('OrderID')}: {result.get('Cost')} (APIs: {apis_used})")
-                            else:
-                                st.error(f"❌ {result.get('OrderID')}: {result.get('Error', 'Failed')[:200]}")
-                            
-                            if len(st.session_state.processed_indices) >= total:
-                                st.session_state.processing_complete = True
-                                st.balloons()
-                            
-                            st.rerun()
-            
-            with col3:
-                if st.button("🔄 Refresh", use_container_width=True):
-                    st.rerun
+                                apis_used = ", ".join(result.get("APIsUsed", ["N/A"])[:
