@@ -103,7 +103,7 @@ def safe_string(value, default=""):
 def get_next_api_config():
     """Get next API config in round-robin fashion"""
     idx = next(_api_iterator)
-    return API_CONFIGS[idx].copy()  # Return a copy to avoid reference issues
+    return API_CONFIGS[idx].copy()
 
 def create_robust_session():
     session = requests.Session()
@@ -119,9 +119,8 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
     
     # Try multiple API endpoints if client not found
     for api_attempt in range(max_api_fallbacks):
-        # Select API endpoint - if api_config provided, try it first, then cycle through others
+        # Select API endpoint
         if api_attempt == 0 and api_config is not None:
-            # Find the index of the provided api_config
             try:
                 current_api_index = API_CONFIGS.index(api_config)
             except (ValueError, IndexError):
@@ -150,7 +149,6 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
                     
                     response = session.post(current_api["url"], headers=headers, json=payload_copy, params=params, timeout=timeout)
 
-                    # ✅ SUCCESS
                     if response.status_code == 200:
                         try:
                             response_data = response.json()
@@ -192,17 +190,15 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
                                 "chunk_num": chunk_num, "total_chunks": total_chunks, "api_used": current_api["name"]
                             }
 
-                    # ✅ HTTP 500 with Client Not Found - TRY NEXT API
                     elif response.status_code == 500:
                         error_text = response.text[:500] if response.text else ""
                         try:
                             error_json = json.loads(response.text)
                             exception_msg = error_json.get("ExceptionMessage", "")
                             if "is not found" in exception_msg or "Client" in exception_msg:
-                                # Client not found on this API - try next one
                                 if api_attempt < max_api_fallbacks - 1:
                                     session.close()
-                                    break  # Break retry loop, go to next API
+                                    break
                         except:
                             pass
                         
@@ -219,7 +215,6 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
                                 "chunk_num": chunk_num, "total_chunks": total_chunks, "api_used": current_api["name"]
                             }
 
-                    # OTHER ERRORS
                     else:
                         error_text = response.text[:300] if response.text else "No details"
                         return {
@@ -251,7 +246,6 @@ def submit_chunk(payload, client_code, order_id, batch_id, dry_run=True, chunk_n
         finally:
             session.close()
     
-    # All APIs exhausted
     return {
         "success": False, "cost": 0.0, "base_amount": 0.0, "fuel_surcharge": 0.0,
         "public_total": 0.0, "service": "N/A", "carrier": "N/A", "error": f"Client {client_code} not found on any API endpoint",
@@ -365,7 +359,6 @@ def process_single_order(row, fallback_client_code, batch_id, dry_run=True, chun
             
             client_code_val = safe_string(row.get('client_code', fallback_client_code)) or fallback_client_code
             
-            # Use round-robin API selection with fallback
             api_config = get_next_api_config()
             result = submit_chunk(payload, client_code_val, customer_order, batch_id, dry_run, chunk_num, num_chunks, max_retries=3, api_config=api_config)
             chunk_results.append(result)
@@ -478,17 +471,13 @@ def main():
         **Expected Speedup:** ~6x faster than single endpoint
         """)
         
-        # Show API status
         for i, config in enumerate(API_CONFIGS, 1):
             st.write(f"{i}. {config['name']}")
         
         st.markdown("---")
-        
         st.header("📊 Progress")
         
-        parallel_workers = st.slider("🔢 Parallel Workers (1-6)", 1, 6, 6,
-                                     help="Number of orders to process simultaneously")
-        
+        parallel_workers = st.slider("🔢 Parallel Workers (1-6)", 1, 6, 6)
         auto_continue = st.checkbox("🔄 Auto-Continue Mode", value=False)
         
         if auto_continue:
@@ -496,8 +485,7 @@ def main():
         else:
             st.warning("⏸️ **Auto-Continue OFF**")
         
-        delay_seconds = st.slider("⏱️ Delay Between Batches (seconds)", 1, 10, 2,
-                                  help="Delay between batches of parallel orders")
+        delay_seconds = st.slider("⏱️ Delay Between Batches (seconds)", 1, 10, 2)
         
         if dry_run:
             st.warning("⚠️ Dry Run ON")
@@ -533,7 +521,8 @@ def main():
         with col1:
             uploaded_file = st.file_uploader("📁 Upload CSV/Excel", type=['csv', 'xlsx', 'xls'])
         with col2:
-            text_input = st.text_area("📋 Or Paste Data", height=150)
+            text_input = st.text_area("📋 Or Paste Data (CSV format)", height=150, 
+                                     help="Paste CSV data with columns: name, services, city, province, etc.")
         
         if st.button("🚀 Load File", type="primary"):
             with st.spinner("🔍 Parsing file..."):
@@ -582,20 +571,18 @@ def main():
             apis_used = ", ".join(last.get("APIsUsed", ["N/A"])[:3])
             st.info(f"📦 Last: {last.get('OrderID', 'N/A')} - {last.get('City')}, {last.get('Province')} - {last.get('Cost')} - APIs: {apis_used}")
         
-        # RATE LIMIT WARNING
         if st.session_state.consecutive_500_errors >= 10:
             st.error(f"⚠️ **{st.session_state.consecutive_500_errors} consecutive HTTP 500 errors.** All 6 APIs may be overloaded. Consider:")
             st.write("1. Increase delay between batches (sidebar)")
             st.write("2. Reduce parallel workers")
             st.write("3. Contact TechSHIP support about rate limits")
         
-        # ✅ TRUE PARALLEL PROCESSING WITH AUTO-CONTINUE
+        # AUTO-CONTINUE PROCESSING
         if auto_continue and remaining > 0 and not st.session_state.processing_complete:
             current_time = time.time()
             time_since_last = current_time - st.session_state.last_process_time
             
             if time_since_last >= delay_seconds or st.session_state.last_process_time == 0:
-                # Get next batch of orders to process in parallel
                 batch_size = parallel_workers
                 start_idx = processed
                 end_idx = min(start_idx + batch_size, total)
@@ -605,7 +592,6 @@ def main():
                 with status_container:
                     st.info(f"⏳ Processing {len(batch_indices)} orders in parallel ({start_idx + 1}-{end_idx} of {total})...")
                 
-                # Process orders in parallel using ThreadPoolExecutor
                 batch_results = []
                 with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_workers) as executor:
                     futures = []
@@ -615,18 +601,15 @@ def main():
                                                st.session_state.batch_id, dry_run, chunk_size)
                         futures.append((idx, future))
                     
-                    # Collect results as they complete
                     for idx, future in futures:
                         result = future.result()
                         batch_results.append((idx, result))
                 
-                # Sort results by original index and add to session state
                 batch_results.sort(key=lambda x: x[0])
                 for idx, result in batch_results:
                     st.session_state.all_results.append(result)
                     st.session_state.processed_indices.append(idx)
                     
-                    # Track consecutive 500 errors
                     error_msg = result.get("Error", "")
                     if error_msg and "HTTP 500" in str(error_msg):
                         st.session_state.consecutive_500_errors += 1
@@ -653,13 +636,13 @@ def main():
                 time.sleep(1)
                 st.rerun()
         
-        # ✅ MANUAL PARALLEL PROCESSING BUTTONS
+        # MANUAL BUTTONS
         if not auto_continue or st.session_state.processing_complete:
             col1, col2, col3, col4 = st.columns(4)
             
             with col1:
                 if remaining > 0 and not st.session_state.processing_complete:
-                    if st.button(f"▶️ Process {parallel_workers} Orders", type="primary" if not auto_continue else "secondary", use_container_width=True):
+                    if st.button(f"▶️ Process {parallel_workers} Orders", type="primary", use_container_width=True):
                         batch_size = parallel_workers
                         start_idx = processed
                         end_idx = min(start_idx + batch_size, total)
@@ -687,7 +670,6 @@ def main():
                             st.session_state.all_results.append(result)
                             st.session_state.processed_indices.append(idx)
                             
-                            # Track consecutive 500 errors
                             error_msg = result.get("Error", "")
                             if error_msg and "HTTP 500" in str(error_msg):
                                 st.session_state.consecutive_500_errors += 1
@@ -716,7 +698,6 @@ def main():
                             st.session_state.all_results.append(result)
                             st.session_state.processed_indices.append(idx)
                             
-                            # Track consecutive 500 errors
                             error_msg = result.get("Error", "")
                             if error_msg and "HTTP 500" in str(error_msg):
                                 st.session_state.consecutive_500_errors += 1
@@ -724,4 +705,81 @@ def main():
                                 st.session_state.consecutive_500_errors = 0
                             
                             if result.get("Status", "").startswith("✅"):
-                                apis_used = ", ".join(result.get("APIsUsed", ["N/A"])[:
+                                apis_used = ", ".join(result.get("APIsUsed", ["N/A"])[:2])
+                                st.success(f"✅ {result.get('OrderID')}: {result.get('Cost')} (APIs: {apis_used})")
+                            else:
+                                st.error(f"❌ {result.get('OrderID')}: {str(result.get('Error', 'Failed'))[:200]}")
+                            
+                            if len(st.session_state.processed_indices) >= total:
+                                st.session_state.processing_complete = True
+                                st.balloons()
+                            
+                            st.rerun()
+            
+            with col3:
+                if st.button("🔄 Refresh", use_container_width=True):
+                    st.rerun()
+            
+            with col4:
+                if st.session_state.all_results:
+                    csv = pd.DataFrame(st.session_state.all_results).to_csv(index=False).encode('utf-8')
+                    st.download_button("💾 Download", csv, f"techship_{st.session_state.batch_id}.csv", "text/csv", use_container_width=True)
+        
+        if st.button("🗑️ Reset & New File"):
+            for key in ["file_uploaded", "all_orders", "processed_indices", "all_results", "batch_id", "total_orders", "processing_complete", "last_process_time", "consecutive_500_errors"]:
+                if key == "file_uploaded":
+                    st.session_state[key] = False
+                elif key in ["all_orders", "processed_indices", "all_results"]:
+                    st.session_state[key] = []
+                elif key == "batch_id":
+                    st.session_state[key] = ""
+                elif key == "processing_complete":
+                    st.session_state[key] = False
+                else:
+                    st.session_state[key] = 0
+            st.rerun()
+        
+        if st.session_state.all_results:
+            st.subheader(f"📊 Results ({len(st.session_state.all_results)} orders)")
+            
+            results_df = pd.DataFrame(st.session_state.all_results)
+            display_cols = ["OrderID", "Status", "City", "Province", "Boxes", "Chunks", "Cost", "Service", "Carrier"]
+            if "Error" in results_df.columns:
+                display_cols.append("Error")
+            if "APIsUsed" in results_df.columns:
+                display_cols.append("APIsUsed")
+            
+            st.dataframe(results_df[display_cols].tail(50), use_container_width=True)
+            
+            col1, col2, col3 = st.columns(3)
+            success = sum(1 for r in st.session_state.all_results if "✅" in r.get("Status", ""))
+            col1.metric("Successful", success)
+            col2.metric("Failed", len(st.session_state.all_results) - success)
+            total_cost = sum(safe_float(r.get('Cost', '$0').replace('$', '')) for r in st.session_state.all_results)
+            col3.metric("Total Cost", f"${total_cost:.2f}")
+            
+            api_usage = defaultdict(int)
+            for r in st.session_state.all_results:
+                for api in r.get("APIsUsed", []):
+                    api_usage[api] += 1
+            if api_usage:
+                st.write("🔗 **API Usage:**")
+                for api, count in sorted(api_usage.items(), key=lambda x: -x[1]):
+                    st.write(f"- {api}: {count} requests")
+        
+        if remaining > 0:
+            if auto_continue:
+                est_time = (remaining / parallel_workers) * delay_seconds
+                st.info(f"🔄 **Auto-Processing:** {remaining} orders remaining with {parallel_workers} parallel workers...")
+                st.write(f"⏱️ Est. time: ~{est_time // 60} min {est_time % 60} sec")
+            else:
+                st.info(f"⏭️ {remaining} orders remaining.")
+        else:
+            st.success("🎉 All orders processed!")
+            
+            if st.session_state.all_results:
+                csv = pd.DataFrame(st.session_state.all_results).to_csv(index=False).encode('utf-8')
+                st.download_button("💾 Download Final Report", csv, f"techship_FINAL_{st.session_state.batch_id}.csv", "text/csv", type="primary", use_container_width=True)
+
+if __name__ == "__main__":
+    main()
